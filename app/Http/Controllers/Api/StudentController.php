@@ -11,6 +11,7 @@ use App\Models\Student;
 use App\Models\StudentGradeLevel;
 use App\Services\EnrollmentService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -20,34 +21,50 @@ class StudentController extends Controller {
     public function index(Request $request) {
         $this->authorize('viewAny', Student::class);
         $user = $request->user();
-        $query = Student::query()->with(self::LOAD);
 
-        if (! $user->isAdmin()) {
-            // Teachers only see students enrolled in one of their own classes (spec §20).
-            $classIds = $user->teacher?->classAssignments()->pluck('id') ?? collect();
-            $query->whereHas('enrollments', fn ($q) => $q->whereIn('class_assignment_id', $classIds));
-        }
-        if ($request->filled('class_assignment_id')) {
-            $query->whereHas('enrollments', fn ($q) => $q->where('class_assignment_id', $request->class_assignment_id));
-        }
-        if ($request->filled('section_id')) {
-            $query->whereHas('enrollments', fn ($q) => $q->where('section_id', $request->section_id));
-        }
-        if ($request->filled('grade_level_id')) {
-            $activeYear = AcademicYear::where('is_active', true)->value('id');
-            $query->whereHas('yearLevels', fn ($q) => $q
-                ->where('grade_level_id', $request->grade_level_id)
-                ->when($activeYear, fn ($w) => $w->where('academic_year_id', $activeYear)));
-        }
-        if ($request->filled('search')) {
-            $search = $request->search;
-            $query->where(function ($q) use ($search) {
-                $q->where('first_name', 'like', "%{$search}%")
-                    ->orWhere('last_name', 'like', "%{$search}%")
-                    ->orWhere('student_id', 'like', "%{$search}%");
-            });
-        }
-        return StudentResource::collection($query->paginate($request->per_page ?? 20));
+        $cacheKey = 'students_' . md5(json_encode([
+            'user_id' => $user->id,
+            'is_admin' => $user->isAdmin(),
+            'class_assignment_id' => $request->class_assignment_id,
+            'section_id' => $request->section_id,
+            'grade_level_id' => $request->grade_level_id,
+            'search' => $request->search,
+            'page' => $request->page,
+            'per_page' => $request->per_page ?? 20,
+        ]));
+
+        $result = Cache::remember($cacheKey, 60, function () use ($request, $user) {
+            $query = Student::query()->with(self::LOAD);
+
+            if (! $user->isAdmin()) {
+                $classIds = $user->teacher?->classAssignments()->pluck('id') ?? collect();
+                $query->whereHas('enrollments', fn ($q) => $q->whereIn('class_assignment_id', $classIds));
+            }
+            if ($request->filled('class_assignment_id')) {
+                $query->whereHas('enrollments', fn ($q) => $q->where('class_assignment_id', $request->class_assignment_id));
+            }
+            if ($request->filled('section_id')) {
+                $query->whereHas('enrollments', fn ($q) => $q->where('section_id', $request->section_id));
+            }
+            if ($request->filled('grade_level_id')) {
+                $activeYear = AcademicYear::where('is_active', true)->value('id');
+                $query->whereHas('yearLevels', fn ($q) => $q
+                    ->where('grade_level_id', $request->grade_level_id)
+                    ->when($activeYear, fn ($w) => $w->where('academic_year_id', $activeYear)));
+            }
+            if ($request->filled('search')) {
+                $search = $request->search;
+                $query->where(function ($q) use ($search) {
+                    $q->where('first_name', 'like', "%{$search}%")
+                        ->orWhere('last_name', 'like', "%{$search}%")
+                        ->orWhere('student_id', 'like', "%{$search}%");
+                });
+            }
+            $collection = StudentResource::collection($query->paginate($request->per_page ?? 20));
+            return $collection->response($request)->getData(true);
+        });
+
+        return response()->json($result);
     }
 
     public function store(StoreStudentRequest $request, EnrollmentService $enrollments) {

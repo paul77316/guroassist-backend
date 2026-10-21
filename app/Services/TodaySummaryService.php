@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Intervention;
 use App\Models\User;
+use Illuminate\Support\Facades\Cache;
 
 /**
  * The dashboard "Today" counts. Counts only: no names, no text, no stored data, neutral wording.
@@ -27,14 +28,17 @@ class TodaySummaryService
         }
 
         $today = $this->guard->today();
+        $cacheKey = "dashboard_summary_{$user->id}_{$today}";
 
-        return [
-            'applies' => true,
-            'today' => $today,
-            'follow_ups_due' => $this->followUpsDue($user, $today),
-            'students_to_review' => $this->studentsToReview($user),
-            'active_interventions' => $this->activeInterventions($user, $today),
-        ];
+        return Cache::remember($cacheKey, 300, function () use ($user, $today) {
+            return [
+                'applies' => true,
+                'today' => $today,
+                'follow_ups_due' => $this->followUpsDue($user, $today),
+                'students_to_review' => $this->studentsToReview($user),
+                'active_interventions' => $this->activeInterventions($user, $today),
+            ];
+        });
     }
 
     /** @return array{interventions: int, parent_contacts: int, total: int, overdue: int} */

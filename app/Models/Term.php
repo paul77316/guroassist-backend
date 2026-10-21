@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Cache;
 
 class Term extends Model
 {
@@ -17,6 +18,18 @@ class Term extends Model
         'start_date' => 'date',
         'end_date' => 'date',
     ];
+
+    protected static function booted()
+    {
+        static::saved(function ($term) {
+            Cache::forget("terms_{$term->academic_year_id}");
+            Cache::forget('terms_all');
+        });
+        static::deleted(function ($term) {
+            Cache::forget("terms_{$term->academic_year_id}");
+            Cache::forget('terms_all');
+        });
+    }
 
     public function academicYear() { return $this->belongsTo(AcademicYear::class); }
 }
