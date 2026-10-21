@@ -1,0 +1,740 @@
+===== app/Services/StudentRecordGuard.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\ClassAssignment;
+     6	use App\Models\Student;
+     7	use App\Models\User;
+     8	use Carbon\Carbon;
+     9	use Illuminate\Support\Facades\Gate;
+    10	use Illuminate\Validation\ValidationException;
+    11	
+    12	/**
+    13	 * Checks shared by notes, interventions and parent communications.
+    14	 * The server decides ownership and class membership; the client only names a student and a class.
+    15	 */
+    16	class StudentRecordGuard
+    17	{
+    18	    public function __construct(private AttendanceService $attendance) {}
+    19	
+    20	    /** "Today" in the school timezone (config monitoring.timezone, set with SCHOOL_TIMEZONE). */
+    21	    public function today(): string
+    22	    {
+    23	        return Carbon::now(config('monitoring.timezone'))->toDateString();
+    24	    }
+    25	
+    26	    /**
+    27	     * May this user attach a NEW record to this student (and optional class)?
+    28	     * Student must be visible (StudentPolicy::view). A class must be active, belong to the user
+    29	     * (admins excepted) and have the student on its roster. Returns the class, or null for a general record.
+    30	     */
+    31	    public function assertContext(User $user, Student $student, ?int $classId): ?ClassAssignment
+    32	    {
+    33	        Gate::forUser($user)->authorize('view', $student);
+    34	
+    35	        if ($classId === null) {
+    36	            return null;
+    37	        }
+    38	
+    39	        // Archived classes are soft-deleted, so find() already leaves them out; status is a second guard.
+    40	        // One message for "missing", "archived" and "not yours" so ids cannot be probed.
+    41	        $ca = ClassAssignment::query()->find($classId);
+    42	        $mine = $ca && ($user->isAdmin() || ($user->teacher && $ca->teacher_id === $user->teacher->id));
+    43	        if (! $ca || $ca->status !== 'active' || ! $mine) {
+    44	            throw ValidationException::withMessages([
+    45	                'class_assignment_id' => ['This class is not available for new records.'],
+    46	            ]);
+    47	        }
+    48	
+    49	        if (! $this->attendance->roster($ca)->pluck('id')->contains($student->id)) {
+    50	            throw ValidationException::withMessages([
+    51	                'class_assignment_id' => ['This student is not enrolled in the selected class.'],
+    52	            ]);
+    53	        }
+    54	
+    55	        return $ca;
+    56	    }
+    57	
+    58	    /**
+    59	     * One audit row per admin READ request (not per record). Ids and record type only, never text.
+    60	     * Does nothing for teachers or empty results.
+    61	     */
+    62	    public function auditAdminRead(User $user, Student $student, string $recordType, array $ids): void
+    63	    {
+    64	        if (! $user->isAdmin() || $ids === []) {
+    65	            return;
+    66	        }
+    67	
+    68	        AuditLogger::log($user, $student, 'admin_read', null, [
+    69	            'record_type' => $recordType,
+    70	            'record_ids' => array_values($ids),
+    71	        ]);
+    72	    }
+    73	}
+===== app/Services/TeacherStudentScope.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\User;
+     6	use Illuminate\Database\Eloquent\Builder;
+     7	
+     8	/**
+     9	 * The "student still in your classes" rule, used by the due list for interventions and communications.
+    10	 * It is the same rule InterventionListService applies and StudentPolicy::view uses for teachers: the student
+    11	 * must be enrolled in one of the user's own classes. Archived classes are soft-deleted, so they never count.
+    12	 * The query must have a student() relation. A user without a teacher profile (an admin) matches nothing.
+    13	 */
+    14	class TeacherStudentScope
+    15	{
+    16	    public function apply(Builder $query, User $user): Builder
+    17	    {
+    18	        $teacher = $user->teacher;
+    19	        if (! $teacher) {
+    20	            return $query->whereRaw('1 = 0');
+    21	        }
+    22	
+    23	        $classIds = $teacher->classAssignments()->pluck('id');
+    24	
+    25	        return $query->whereHas('student', fn ($s) => $s->whereHas(
+    26	            'enrollments',
+    27	            fn ($e) => $e->whereIn('class_assignment_id', $classIds)
+    28	        ));
+    29	    }
+    30	}
+===== app/Models/Concerns/HidesArchivedClasses.php
+     1	<?php
+     2	
+     3	namespace App\Models\Concerns;
+     4	
+     5	use App\Models\ClassAssignment;
+     6	use Illuminate\Database\Eloquent\Builder;
+     7	
+     8	/**
+     9	 * Shared by the intervention-module models. Records of an archived class are hidden from everyone
+    10	 * (admins too). Archiving soft-deletes a class, so ClassAssignment's default scope already leaves
+    11	 * archived classes out; the status check is a second guard. Records with no class always show.
+    12	 * Nothing is deleted: restore the class and its records reappear.
+    13	 */
+    14	trait HidesArchivedClasses
+    15	{
+    16	    public function scopeInActiveClasses(Builder $query): Builder
+    17	    {
+    18	        $col = $this->qualifyColumn('class_assignment_id');
+    19	
+    20	        return $query->where(function (Builder $q) use ($col) {
+    21	            $q->whereNull($col)->orWhereIn(
+    22	                $col,
+    23	                ClassAssignment::query()->where('status', 'active')->select('id')
+    24	            );
+    25	        });
+    26	    }
+    27	
+    28	    public function scopeAuthoredBy(Builder $query, int $userId): Builder
+    29	    {
+    30	        return $query->where($this->qualifyColumn('author_id'), $userId);
+    31	    }
+    32	}
+===== app/Models/ClassAssignment.php
+     1	<?php 
+     2	
+     3	namespace App\Models; 
+     4	use Illuminate\Database\Eloquent\Model; 
+     5	use Illuminate\Database\Eloquent\SoftDeletes;
+     6	
+     7	class ClassAssignment extends Model { 
+     8	    use SoftDeletes;
+     9	    protected $fillable = ['teacher_id', 'subject_id', 'section_id', 'academic_year_id', 'status']; 
+    10	    public function teacher() { return $this->belongsTo(Teacher::class); } 
+    11	    public function subject() { return $this->belongsTo(Subject::class); } 
+    12	    public function section() { return $this->belongsTo(Section::class); } 
+    13	    public function academicYear() { return $this->belongsTo(AcademicYear::class); } 
+    14	    public function enrollments() { return $this->hasMany(Enrollment::class); }
+    15	}===== app/Models/Student.php
+     1	<?php 
+     2	namespace App\Models; 
+     3	use Illuminate\Database\Eloquent\Factories\HasFactory; 
+     4	use Illuminate\Database\Eloquent\Model; 
+     5	use Illuminate\Database\Eloquent\SoftDeletes; 
+     6	
+     7	class Student extends Model { 
+     8	    use HasFactory, SoftDeletes; 
+     9	
+    10	    protected $fillable = [ 
+    11	        'student_id', 
+    12	        'first_name', 
+    13	        'middle_name', 
+    14	        'last_name', 
+    15	        'sex', 
+    16	        'date_of_birth', 
+    17	        'contact_number', 
+    18	        'guardian_name', 
+    19	        'guardian_contact', 
+    20	        'guardian_email',
+    21	        'status', 
+    22	
+    23	    ]; 
+    24	
+    25	    protected $casts = [ 
+    26	        'date_of_birth' => 'date', 
+    27	    ]; 
+    28	
+    29	    public function enrollments() { 
+    30	        return $this->hasMany(Enrollment::class); 
+    31	    } 
+    32	    public function yearLevels() { return $this->hasMany(StudentGradeLevel::class); }
+    33	    public function notes() { return $this->hasMany(StudentNote::class); }
+    34	    public function interventions() { return $this->hasMany(Intervention::class); }
+    35	    public function parentCommunications() { return $this->hasMany(ParentCommunication::class); }
+    36	    public function sections() { 
+    37	        return $this->belongsToMany(Section::class, 'enrollments') 
+    38	            ->withPivot('academic_year_id') 
+    39	            ->withTimestamps(); 
+    40	    } 
+    41	
+    42	    // Convenience accessor: $student->full_name instead of concatenating manually everywhere 
+    43	    public function getFullNameAttribute(): string { 
+    44	        $middle = $this->middle_name ? " {$this->middle_name} " : ' '; 
+    45	        return trim("{$this->first_name}{$middle}{$this->last_name}"); 
+    46	    } 
+    47	}===== app/Models/Teacher.php
+     1	<?php 
+     2	namespace App\Models; 
+     3	use Illuminate\Database\Eloquent\Factories\HasFactory; 
+     4	use Illuminate\Database\Eloquent\Model; 
+     5	
+     6	class Teacher extends Model { 
+     7	    use HasFactory; protected $fillable = [ 'user_id', 'employee_id', 'contact_number', ]; 
+     8	    public function user() { 
+     9	        return $this->belongsTo(User::class); 
+    10	    } 
+    11	
+    12	    public function classAssignments() { 
+    13	        return $this->hasMany(ClassAssignment::class); 
+    14	    } 
+    15	}===== app/Models/User.php
+     1	<?php 
+     2	
+     3	namespace App\Models;
+     4	use Database\Factories\UserFactory; 
+     5	use Illuminate\Database\Eloquent\Attributes\Fillable; 
+     6	use Illuminate\Database\Eloquent\Attributes\Hidden; 
+     7	use Illuminate\Database\Eloquent\Factories\HasFactory; 
+     8	use Illuminate\Foundation\Auth\User as Authenticatable; 
+     9	use Illuminate\Notifications\Notifiable; 
+    10	use Laravel\Sanctum\HasApiTokens; 
+    11	
+    12	#[Fillable(['name', 'email', 'password', 'role'])] 
+    13	#[Hidden(['password', 'remember_token'])] 
+    14	class User extends Authenticatable { 
+    15		/** @use HasFactory<UserFactory> */
+    16		 use HasApiTokens, HasFactory, Notifiable; 
+    17		 protected function casts(): array { 
+    18			return [ 'email_verified_at' => 'datetime', 'password' => 'hashed', ]; 
+    19		} 
+    20		public function teacher() { 
+    21			return $this->hasOne(Teacher::class); 
+    22		} 
+    23		public function isAdmin(): bool { 
+    24			return $this->role === 'admin'; 
+    25		} 
+    26		public function isTeacher(): bool { 
+    27			return $this->role === 'teacher'; 
+    28		} 
+    29	}===== app/Providers/AppServiceProvider.php
+     1	<?php
+     2	
+     3	namespace App\Providers;
+     4	
+     5	use Illuminate\Support\ServiceProvider;
+     6	use App\Models\Student; 
+     7	use App\Policies\StudentPolicy;
+     8	use Illuminate\Support\Facades\Gate;
+     9	
+    10	class AppServiceProvider extends ServiceProvider
+    11	{
+    12	    /**
+    13	     * Register any application services.
+    14	     */
+    15	    public function register(): void
+    16	    {
+    17	        //
+    18	    }
+    19	
+    20	    /**
+    21	     * Bootstrap any application services.
+    22	     */
+    23	    public function boot(): void
+    24	    {
+    25	        //
+    26	         Gate::policy(Student::class, StudentPolicy::class);
+    27	         Gate::policy(\App\Models\ClassAssignment::class, \App\Policies\ClassAssignmentPolicy::class);
+    28	         Gate::policy(\App\Models\Term::class, \App\Policies\TermPolicy::class);
+    29	         Gate::policy(\App\Models\AcademicYear::class, \App\Policies\SetupPolicy::class);
+    30	         Gate::policy(\App\Models\GradeLevel::class, \App\Policies\SetupPolicy::class);
+    31	         Gate::policy(\App\Models\Subject::class, \App\Policies\SetupPolicy::class);
+    32	         Gate::policy(\App\Models\Assignment::class, \App\Policies\AssignmentPolicy::class);
+    33	         Gate::policy(\App\Models\Intervention::class, \App\Policies\InterventionPolicy::class);
+    34	         Gate::policy(\App\Models\StudentNote::class, \App\Policies\StudentNotePolicy::class);
+    35	         Gate::policy(\App\Models\ParentCommunication::class, \App\Policies\ParentCommunicationPolicy::class);
+    36	    }
+    37	}
+===== app/Http/Controllers/Api/Concerns/HandlesStudentRecords.php
+     1	<?php
+     2	
+     3	namespace App\Http\Controllers\Api\Concerns;
+     4	
+     5	use Illuminate\Database\Eloquent\Collection;
+     6	use Illuminate\Database\Eloquent\Model;
+     7	use Illuminate\Http\Request;
+     8	
+     9	trait HandlesStudentRecords
+    10	{
+    11	    /**
+    12	     * Eager-load what the resources need so queries stay flat as records grow.
+    13	     * Works for one model or a collection. Admins also get the author.
+    14	     */
+    15	    protected function withContext(Model|Collection $records, Request $request, array $extra = []): Model|Collection
+    16	    {
+    17	        $relations = ['classAssignment.section.gradeLevel', 'classAssignment.subject'];
+    18	        if ($request->user()->isAdmin()) {
+    19	            $relations[] = 'author';
+    20	        }
+    21	
+    22	        return $records->load(array_merge($relations, $extra));
+    23	    }
+    24	
+    25	    protected function notDeletedResponse(string $what)
+    26	    {
+    27	        $msg = "This {$what} is not deleted.";
+    28	
+    29	        return response()->json(['message' => $msg, 'errors' => ['record' => [$msg]]], 422);
+    30	    }
+    31	}
+===== app/Http/Controllers/Api/MonitoringSettingController.php
+     1	<?php
+     2	
+     3	namespace App\Http\Controllers\Api;
+     4	
+     5	use App\Http\Controllers\Controller;
+     6	use App\Http\Requests\UpdateMonitoringSettingsRequest;
+     7	use App\Models\MonitoringSetting;
+     8	use App\Services\AttendanceSummaryService;
+     9	use Illuminate\Http\Request;
+    10	
+    11	class MonitoringSettingController extends Controller
+    12	{
+    13	    public function __construct(private AttendanceSummaryService $service) {}
+    14	
+    15	    public function show(Request $request)
+    16	    {
+    17	        $teacher = $request->user()->teacher;
+    18	        if (! $teacher) {
+    19	            return response()->json(['message' => 'Only teachers have monitoring settings.'], 403);
+    20	        }
+    21	
+    22	        return response()->json(['data' => $this->service->settingsForTeacher($teacher->id)]);
+    23	    }
+    24	
+    25	    public function update(UpdateMonitoringSettingsRequest $request)
+    26	    {
+    27	        $teacher = $request->user()->teacher;
+    28	        if (! $teacher) {
+    29	            return response()->json(['message' => 'Only teachers have monitoring settings.'], 403);
+    30	        }
+    31	
+    32	        MonitoringSetting::updateOrCreate(['teacher_id' => $teacher->id], $request->validated());
+    33	
+    34	        return response()->json(['data' => $this->service->settingsForTeacher($teacher->id)]);
+    35	    }
+    36	}
+===== tests/TestCase.php
+     1	<?php
+     2	
+     3	namespace Tests;
+     4	
+     5	use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
+     6	use RuntimeException;
+     7	
+     8	abstract class TestCase extends BaseTestCase
+     9	{
+    10	    /** Runs when the app is built, before any trait (such as RefreshDatabase) can wipe a database. */
+    11	    public function createApplication()
+    12	    {
+    13	        $app = parent::createApplication();
+    14	
+    15	        $default = $app['config']->get('database.default');
+    16	        $name = (string) $app['config']->get("database.connections.{$default}.database");
+    17	
+    18	        if (! str_ends_with($name, '_test')) {
+    19	            throw new RuntimeException("Refusing to run tests: database [{$name}] does not end in _test.");
+    20	        }
+    21	
+    22	        return $app;
+    23	    }
+    24	}===== config/monitoring.php
+     1	<?php
+     2	
+     3	return [
+     4	    // Starting values; each teacher can override them in Settings.
+     5	    'attendance_rate_threshold' => 80,
+     6	    'consecutive_absence_threshold' => 3,
+     7	    'min_days_for_rate' => 5,
+     8	    'missing_assignments_threshold' => 3,
+     9	
+    10	    // "Today" for date ranges (the school's timezone, independent of the app timezone).
+    11	    'timezone' => 'Asia/Manila',
+    12	    'guardian_email_delay_minutes' => 5,
+    13	    'guardian_email_max_age_days' => 2,
+    14	];===== config/filesystems.php
+     1	<?php
+     2	
+     3	return [
+     4	
+     5	    /*
+     6	    |--------------------------------------------------------------------------
+     7	    | Default Filesystem Disk
+     8	    |--------------------------------------------------------------------------
+     9	    |
+    10	    | Here you may specify the default filesystem disk that should be used
+    11	    | by the framework. The "local" disk, as well as a variety of cloud
+    12	    | based disks are available to your application for file storage.
+    13	    |
+    14	    */
+    15	
+    16	    'default' => env('FILESYSTEM_DISK', 'local'),
+    17	
+    18	    /*
+    19	    |--------------------------------------------------------------------------
+    20	    | Filesystem Disks
+    21	    |--------------------------------------------------------------------------
+    22	    |
+    23	    | Below you may configure as many filesystem disks as necessary, and you
+    24	    | may even configure multiple disks for the same driver. Examples for
+    25	    | most supported storage drivers are configured here for reference.
+    26	    |
+    27	    | Supported drivers: "local", "ftp", "sftp", "s3"
+    28	    |
+    29	    */
+    30	
+    31	    'disks' => [
+    32	
+    33	        'local' => [
+    34	            'driver' => 'local',
+    35	            'root' => storage_path('app/private'),
+    36	            'serve' => true,
+    37	            'throw' => false,
+    38	            'report' => false,
+    39	        ],
+    40	
+    41	        'public' => [
+    42	            'driver' => 'local',
+    43	            'root' => storage_path('app/public'),
+    44	            'url' => rtrim(env('APP_URL', 'http://localhost'), '/').'/storage',
+    45	            'visibility' => 'public',
+    46	            'throw' => false,
+    47	            'report' => false,
+    48	        ],
+    49	
+    50	        's3' => [
+    51	            'driver' => 's3',
+    52	            'key' => env('AWS_ACCESS_KEY_ID'),
+    53	            'secret' => env('AWS_SECRET_ACCESS_KEY'),
+    54	            'region' => env('AWS_DEFAULT_REGION'),
+    55	            'bucket' => env('AWS_BUCKET'),
+    56	            'url' => env('AWS_URL'),
+    57	            'endpoint' => env('AWS_ENDPOINT'),
+    58	            'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', false),
+    59	            'throw' => false,
+    60	            'report' => false,
+    61	        ],
+    62	
+    63	    ],
+    64	
+    65	    /*
+    66	    |--------------------------------------------------------------------------
+    67	    | Symbolic Links
+    68	    |--------------------------------------------------------------------------
+    69	    |
+    70	    | Here you may configure the symbolic links that will be created when the
+    71	    | `storage:link` Artisan command is executed. The array keys should be
+    72	    | the locations of the links and the values should be their targets.
+    73	    |
+    74	    */
+    75	
+    76	    'links' => [
+    77	        public_path('storage') => storage_path('app/public'),
+    78	    ],
+    79	
+    80	];
+===== config/cors.php
+     1	<?php 
+     2	
+     3	    return [ 
+     4	        'paths' => ['api/*', 'sanctum/csrf-cookie'],
+     5	        'allowed_methods' => ['*'],
+     6	        'allowed_origins' => [env('FRONTEND_URL', 'http://localhost:5173')],
+     7	        'allowed_origins_patterns' => [],
+     8	        'allowed_headers' => ['*'],
+     9	        'exposed_headers' => [],
+    10	        'max_age' => 0,
+    11	        'supports_credentials' => true,
+    12	    ];===== config/sanctum.php
+     1	<?php
+     2	
+     3	use Illuminate\Cookie\Middleware\EncryptCookies;
+     4	use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
+     5	use Laravel\Sanctum\Http\Middleware\AuthenticateSession;
+     6	use Laravel\Sanctum\Sanctum;
+     7	
+     8	return [
+     9	
+    10	    /*
+    11	    |--------------------------------------------------------------------------
+    12	    | Stateful Domains
+    13	    |--------------------------------------------------------------------------
+    14	    |
+    15	    | Requests from the following domains / hosts will receive stateful API
+    16	    | authentication cookies. Typically, these should include your local
+    17	    | and production domains which access your API via a frontend SPA.
+    18	    |
+    19	    */
+    20	
+    21	    'stateful' => explode(',', env('SANCTUM_STATEFUL_DOMAINS', sprintf(
+    22	        '%s%s',
+    23	        'localhost,localhost:3000,127.0.0.1,127.0.0.1:8000,::1',
+    24	        Sanctum::currentApplicationUrlWithPort(),
+    25	        // Sanctum::currentRequestHost(),
+    26	    ))),
+    27	
+    28	    /*
+    29	    |--------------------------------------------------------------------------
+    30	    | Sanctum Guards
+    31	    |--------------------------------------------------------------------------
+    32	    |
+    33	    | This array contains the authentication guards that will be checked when
+    34	    | Sanctum is trying to authenticate a request. If none of these guards
+    35	    | are able to authenticate the request, Sanctum will use the bearer
+    36	    | token that's present on an incoming request for authentication.
+    37	    |
+    38	    */
+    39	
+    40	    'guard' => ['web'],
+    41	
+    42	    /*
+    43	    |--------------------------------------------------------------------------
+    44	    | Expiration Minutes
+    45	    |--------------------------------------------------------------------------
+    46	    |
+    47	    | This value controls the number of minutes until an issued token will be
+    48	    | considered expired. This will override any values set in the token's
+    49	    | "expires_at" attribute, but first-party sessions are not affected.
+    50	    |
+    51	    */
+    52	
+    53	    'expiration' => null,
+    54	
+    55	    /*
+    56	    |--------------------------------------------------------------------------
+    57	    | Token Prefix
+    58	    |--------------------------------------------------------------------------
+    59	    |
+    60	    | Sanctum can prefix new tokens in order to take advantage of numerous
+    61	    | security scanning initiatives maintained by open source platforms
+    62	    | that notify developers if they commit tokens into repositories.
+    63	    |
+    64	    | See: https://docs.github.com/en/code-security/secret-scanning/about-secret-scanning
+    65	    |
+    66	    */
+    67	
+    68	    'token_prefix' => env('SANCTUM_TOKEN_PREFIX', ''),
+    69	
+    70	    /*
+    71	    |--------------------------------------------------------------------------
+    72	    | Sanctum Middleware
+    73	    |--------------------------------------------------------------------------
+    74	    |
+    75	    | When authenticating your first-party SPA with Sanctum you may need to
+    76	    | customize some of the middleware Sanctum uses while processing the
+    77	    | request. You may change the middleware listed below as required.
+    78	    |
+    79	    */
+    80	
+    81	    'middleware' => [
+    82	        'authenticate_session' => AuthenticateSession::class,
+    83	        'encrypt_cookies' => EncryptCookies::class,
+    84	        'validate_csrf_token' => ValidateCsrfToken::class,
+    85	    ],
+    86	
+    87	];
+===== phpunit.xml
+     1	<?xml version="1.0" encoding="UTF-8"?>
+     2	<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     3	         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+     4	         bootstrap="vendor/autoload.php"
+     5	         colors="true"
+     6	>
+     7	    <testsuites>
+     8	        <testsuite name="Unit">
+     9	            <directory>tests/Unit</directory>
+    10	        </testsuite>
+    11	        <testsuite name="Feature">
+    12	            <directory>tests/Feature</directory>
+    13	        </testsuite>
+    14	    </testsuites>
+    15	    <source>
+    16	        <include>
+    17	            <directory>app</directory>
+    18	        </include>
+    19	    </source>
+    20	    <php>
+    21	        <env name="APP_ENV" value="testing"/>
+    22	        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+    23	        <env name="BCRYPT_ROUNDS" value="4"/>
+    24	        <env name="BROADCAST_CONNECTION" value="null"/>
+    25	        <env name="CACHE_STORE" value="array"/>
+    26	        <env name="DB_CONNECTION" value="mysql" force="true"/>
+    27	        <env name="DB_HOST" value="127.0.0.1" force="true"/>
+    28	        <env name="DB_PORT" value="3306" force="true"/>
+    29	        <env name="DB_DATABASE" value="guro_assist_test" force="true"/>
+    30	        <env name="DB_USERNAME" value="homestead" force="true"/>
+    31	        <env name="DB_PASSWORD" value="secret" force="true"/>
+    32	        <env name="DB_URL" value=""/>
+    33	        <env name="MAIL_MAILER" value="array"/>
+    34	        <env name="QUEUE_CONNECTION" value="sync"/>
+    35	        <env name="SESSION_DRIVER" value="array"/>
+    36	        <env name="PULSE_ENABLED" value="false"/>
+    37	        <env name="TELESCOPE_ENABLED" value="false"/>
+    38	        <env name="NIGHTWATCH_ENABLED" value="false"/>
+    39	    </php>
+    40	</phpunit>
+===== routes/api.php
+     1	<?php 
+     2	use App\Http\Controllers\Api\AuthController; 
+     3	use Illuminate\Support\Facades\Route; 
+     4	use App\Http\Controllers\Api\StudentController;
+     5	use App\Http\Controllers\Api\SectionController;
+     6	use App\Http\Controllers\Api\ClassAssignmentController;  
+     7	use App\Http\Controllers\Api\LookupController;
+     8	use App\Http\Controllers\Api\AttendanceController;
+     9	use App\Http\Controllers\Api\TermController;
+    10	use App\Http\Controllers\Api\ClassStudentController;
+    11	use App\Http\Controllers\Api\AcademicYearController;
+    12	use App\Http\Controllers\Api\GradeLevelController;
+    13	use App\Http\Controllers\Api\SubjectController;
+    14	use App\Http\Controllers\Api\AttendanceSummaryController;
+    15	use App\Http\Controllers\Api\MonitoringSettingController;
+    16	use App\Http\Controllers\Api\StudentProfileController;
+    17	use App\Http\Controllers\Api\AssignmentController;
+    18	use App\Http\Controllers\Api\InterventionController;
+    19	use App\Http\Controllers\Api\StudentNoteController;
+    20	use App\Http\Controllers\Api\ParentCommunicationController;
+    21	use App\Http\Controllers\Api\FollowUpController;
+    22	use App\Http\Controllers\Api\StudentsToReviewController;
+    23	use App\Http\Controllers\Api\InterventionListController;
+    24	use App\Http\Controllers\Api\NotificationController;
+    25	use App\Http\Controllers\Api\DashboardController;
+    26	Route::post('/auth/login', [AuthController::class, 'login']); 
+    27	
+    28	Route::middleware('auth:sanctum')->group(function () { 
+    29	    Route::post('/auth/logout', [AuthController::class, 'logout']); 
+    30	    Route::get('/auth/me', [AuthController::class, 'me']); 
+    31	    Route::apiResource('/students', StudentController::class);
+    32	    Route::get('/sections', [SectionController::class, 'index']);
+    33	    Route::apiResource('class-assignments', ClassAssignmentController::class);
+    34	    Route::get('/grade-levels', [LookupController::class, 'gradeLevels']);
+    35	    Route::get('/subjects', [LookupController::class, 'subjects']);
+    36	    Route::get('/academic-years', [LookupController::class, 'academicYears']);
+    37	    Route::get('/attendance', [AttendanceController::class, 'index']);
+    38	    Route::post('/attendance/bulk', [AttendanceController::class, 'bulkStore']);
+    39	    Route::get('/terms', [LookupController::class, 'terms']);
+    40	    Route::get('class-assignments/{class_assignment}/students', [ClassStudentController::class, 'index']);
+    41	    Route::get('class-assignments/{class_assignment}/student-candidates', [ClassStudentController::class, 'candidates']);
+    42	    Route::post('class-assignments/{class_assignment}/students', [ClassStudentController::class, 'store']);
+    43	    Route::delete('class-assignments/{class_assignment}/students/{student}', [ClassStudentController::class, 'destroy']);
+    44	    Route::get('templates/student-import', [ClassStudentController::class, 'template']);
+    45	    Route::get('class-assignments/{class_assignment}/students/export', [ClassStudentController::class, 'export']);
+    46	    Route::post('class-assignments/{class_assignment}/students/import', [ClassStudentController::class, 'import'])->middleware('throttle:20,1');
+    47	    Route::get('/attendance/summary', [AttendanceSummaryController::class, 'show']);
+    48	    Route::get('/attendance/student', [AttendanceSummaryController::class, 'student']);
+    49	    Route::get('/monitoring/settings', [MonitoringSettingController::class, 'show']);
+    50	    Route::put('/monitoring/settings', [MonitoringSettingController::class, 'update']);
+    51	    Route::get('/students/{student}/profile', [StudentProfileController::class, 'show']);
+    52	    Route::get('/assignments', [AssignmentController::class, 'index']);
+    53	    Route::post('/assignments', [AssignmentController::class, 'store']);
+    54	    Route::get('/assignments/missing', [AssignmentController::class, 'missing']);
+    55	    Route::get('/assignments/{assignment}', [AssignmentController::class, 'show']);
+    56	    Route::put('/assignments/{assignment}', [AssignmentController::class, 'update']);
+    57	    Route::delete('/assignments/{assignment}', [AssignmentController::class, 'destroy']);
+    58	    Route::put('/assignments/{assignment}/submissions', [AssignmentController::class, 'saveSubmissions']);
+    59	    Route::post('/assignments/{assignment}/restore', [AssignmentController::class, 'restore'])->withTrashed();
+    60	    Route::get('/intervention-options', [InterventionController::class, 'options']);
+    61	    Route::get('/follow-ups/due', [FollowUpController::class, 'due']);
+    62	
+    63	    Route::get('/students/{student}/interventions', [InterventionController::class, 'index']);
+    64	    Route::post('/students/{student}/interventions', [InterventionController::class, 'store']);
+    65	    Route::get('/interventions/{intervention}', [InterventionController::class, 'show']);
+    66	    Route::put('/interventions/{intervention}', [InterventionController::class, 'update']);
+    67	    Route::delete('/interventions/{intervention}', [InterventionController::class, 'destroy']);
+    68	    Route::post('/interventions/{intervention}/restore', [InterventionController::class, 'restore'])->withTrashed();
+    69	    Route::post('/interventions/{intervention}/followups', [InterventionController::class, 'addFollowup']);
+    70	
+    71	    Route::get('/students/{student}/notes', [StudentNoteController::class, 'index']);
+    72	    Route::post('/students/{student}/notes', [StudentNoteController::class, 'store']);
+    73	    Route::get('/notes/{note}', [StudentNoteController::class, 'show']);
+    74	    Route::put('/notes/{note}', [StudentNoteController::class, 'update']);
+    75	    Route::delete('/notes/{note}', [StudentNoteController::class, 'destroy']);
+    76	    Route::post('/notes/{note}/restore', [StudentNoteController::class, 'restore'])->withTrashed();
+    77	
+    78	    Route::get('/students/{student}/parent-communications', [ParentCommunicationController::class, 'index']);
+    79	    Route::post('/students/{student}/parent-communications', [ParentCommunicationController::class, 'store']);
+    80	    Route::get('/parent-communications/{communication}', [ParentCommunicationController::class, 'show']);
+    81	    Route::put('/parent-communications/{communication}', [ParentCommunicationController::class, 'update']);
+    82	    Route::delete('/parent-communications/{communication}', [ParentCommunicationController::class, 'destroy']);
+    83	    Route::post('/parent-communications/{communication}/restore', [ParentCommunicationController::class, 'restore'])->withTrashed();
+    84	    Route::post('/parent-communications/{communication}/follow-up-done', [ParentCommunicationController::class, 'markFollowUpDone']);
+    85	    Route::delete('/parent-communications/{communication}/follow-up-done', [ParentCommunicationController::class, 'undoFollowUpDone']);
+    86	    Route::get('/monitoring/students-to-review', [StudentsToReviewController::class, 'index']);
+    87	    Route::get('/monitoring/active-interventions', [StudentsToReviewController::class, 'activeInterventions']);
+    88	    Route::get('/interventions', [InterventionListController::class, 'index']);
+    89	    Route::get('/notifications/summary', [NotificationController::class, 'summary'])->middleware('throttle:90,1');
+    90	    Route::get('/notifications/preferences', [NotificationController::class, 'showPreferences']);
+    91	    Route::put('/notifications/preferences', [NotificationController::class, 'updatePreferences']);
+    92	    Route::get('/dashboard/today', [DashboardController::class, 'today'])->middleware('throttle:90,1');
+    93	    Route::prefix('admin')->group(function () {
+    94	        Route::apiResource('terms', TermController::class)->except('show');
+    95	        Route::apiResource('academic-years', AcademicYearController::class)->except('show');
+    96	        Route::apiResource('grade-levels', GradeLevelController::class)->except('show');
+    97	        Route::apiResource('subjects', SubjectController::class)->except('show');
+    98	    });
+    99	});===== migrations
+0001_01_01_000000_create_users_table.php
+0001_01_01_000001_create_cache_table.php
+0001_01_01_000002_create_jobs_table.php
+2026_09_13_051953_create_personal_access_tokens_table.php
+2026_09_13_060024_add_role_to_users_table.php
+2026_09_13_060217_create_teachers_table.php
+2026_09_21_094009_create_academic_years_table.php
+2026_09_21_094211_create_grade_levels_table.php
+2026_09_21_094256_create_subjects_table.php
+2026_09_21_094334_create_sections_table.php
+2026_09_21_100923_create_class_assignments_table.php
+2026_09_21_102720_create_students_table.php
+2026_09_21_103747_create_enrollments_table.php
+2026_10_02_103750_add_status_and_soft_deletes_to_class_assignments.php
+2026_10_03_050926_create_attendance_table.php
+2026_10_03_084556_create_terms_table.php
+2026_10_03_084559_create_grading_tables.php
+2026_10_04_115605_drop_grading_tables.php
+2026_10_07_102816_add_class_to_enrollments.php
+2026_10_09_080553_create_student_grade_levels_table.php
+2026_10_09_093256_create_monitoring_settings_table.php
+2026_10_10_100000_add_guardian_email_and_notifications.php
+2026_10_12_063452_create_assignments_tables.php
+2026_10_12_064911_assignments_followup_index.php
+2026_10_15_041247_create_intervention_tables.php
+2026_10_18_113358_add_follow_up_done_to_parent_communications.php
+2026_10_18_120000_ensure_follow_up_done_at_column.php
+2026_10_19_000001_add_outcome_to_intervention_followups.php
+2026_10_19_100000_create_notification_preferences_table.php

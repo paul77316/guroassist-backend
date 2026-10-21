@@ -1,0 +1,1140 @@
+===== app/Models/ParentCommunication.php
+     1	<?php
+     2	
+     3	namespace App\Models;
+     4	
+     5	use App\Models\Concerns\HidesArchivedClasses;
+     6	use Illuminate\Database\Eloquent\Model;
+     7	use Illuminate\Database\Eloquent\SoftDeletes;
+     8	
+     9	/** A record of contact the teacher already made. It does not send anything. */
+    10	class ParentCommunication extends Model
+    11	{
+    12	    use SoftDeletes, HidesArchivedClasses;
+    13	
+    14	    // author_id is set by the service from the signed-in user.
+    15	    protected $fillable = [
+    16	        'student_id', 'class_assignment_id', 'contact_date', 'method', 'reason', 'summary', 'follow_up_date',
+    17	    ];
+    18	
+    19	    protected $casts = [
+    20	        'contact_date' => 'date',
+    21	       'follow_up_date' => 'date',
+    22	        'follow_up_done_at' => 'date',
+    23	    ];
+    24	
+    25	    public function student() { return $this->belongsTo(Student::class)->withTrashed(); }
+    26	    public function classAssignment() { return $this->belongsTo(ClassAssignment::class)->withTrashed(); }
+    27	    public function author() { return $this->belongsTo(User::class, 'author_id'); }
+    28	}
+===== app/Services/ParentCommunicationService.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\ParentCommunication;
+     6	use App\Models\Student;
+     7	use App\Models\User;
+     8	use App\Support\InterventionVocabulary;
+     9	use Illuminate\Support\Arr;
+    10	use Illuminate\Support\Collection;
+    11	use Illuminate\Support\Facades\DB;
+    12	use Illuminate\Support\Facades\Gate;
+    13	use Illuminate\Validation\ValidationException;
+    14	
+    15	/**
+    16	 * Log of parent contact the teacher already made. It sends nothing.
+    17	 * Reason and summary text are never written to the audit log.
+    18	 */
+    19	class ParentCommunicationService
+    20	{
+    21	    public function __construct(private StudentRecordGuard $guard, private TeacherStudentScope $scope) {}
+    22	
+    23	    public function create(User $user, Student $student, array $data): ParentCommunication
+    24	    {
+    25	        $classId = ! empty($data['class_assignment_id']) ? (int) $data['class_assignment_id'] : null;
+    26	        $this->guard->assertContext($user, $student, $classId);
+    27	        $this->checkDates($data);
+    28	
+    29	        return DB::transaction(function () use ($user, $student, $data, $classId) {
+    30	            $c = new ParentCommunication(Arr::only($data, ['contact_date', 'method', 'reason', 'summary', 'follow_up_date']));
+    31	            $c->student_id = $student->id;
+    32	            $c->class_assignment_id = $classId;
+    33	            $c->author_id = $user->id;
+    34	            $c->save();
+    35	
+    36	            AuditLogger::log($user, $c, 'created', null, $this->values($c));
+    37	
+    38	            return $c;
+    39	        });
+    40	    }
+    41	
+    42	    public function update(User $user, ParentCommunication $c, array $data): ParentCommunication
+    43	    {
+    44	        $this->checkDates($data);
+    45	        $payload = Arr::only($data, ['contact_date', 'method', 'reason', 'summary', 'follow_up_date']);
+    46	
+    47	        // A new or removed follow-up date means a new follow-up: the old "done" date no longer applies.
+    48	        $clearsDone = $c->follow_up_done_at !== null
+    49	            && array_key_exists('follow_up_date', $payload)
+    50	            && ($payload['follow_up_date'] ?: null) !== $c->follow_up_date?->format('Y-m-d');
+    51	
+    52	        $flags = [
+    53	            'reason_changed' => array_key_exists('reason', $payload) && $payload['reason'] !== $c->reason,
+    54	            'summary_changed' => array_key_exists('summary', $payload) && $payload['summary'] !== $c->summary,
+    55	            'follow_up_done_cleared' => $clearsDone,
+    56	        ];
+    57	        $old = $this->values($c);
+    58	
+    59	        return DB::transaction(function () use ($user, $c, $payload, $old, $flags, $clearsDone) {
+    60	            $c->fill($payload);
+    61	            if ($clearsDone) {
+    62	                $c->follow_up_done_at = null; // not fillable: only the server touches it
+    63	            }
+    64	            $c->save();
+    65	
+    66	            $event = $user->id === $c->author_id ? 'updated' : 'admin_corrected';
+    67	            AuditLogger::log($user, $c, $event, $old, $this->values($c->refresh()) + $flags);
+    68	
+    69	            return $c;
+    70	        });
+    71	    }
+    72	
+    73	    /** Stamps today (school timezone). The client never sends the date. */
+    74	    public function markFollowUpDone(User $user, ParentCommunication $c): ParentCommunication
+    75	    {
+    76	        return DB::transaction(function () use ($user, $c) {
+    77	            $row = $this->lockedAvailable($c);
+    78	
+    79	            if ($row->follow_up_date === null) {
+    80	                throw ValidationException::withMessages(['follow_up_date' => ['This contact has no follow-up date.']]);
+    81	            }
+    82	            if ($row->follow_up_done_at !== null) {
+    83	                throw ValidationException::withMessages(['follow_up_done_at' => ['This follow-up is already marked done.']]);
+    84	            }
+    85	
+    86	            $old = $this->values($row);
+    87	            $row->follow_up_done_at = $this->guard->today();
+    88	            $row->save();
+    89	
+    90	            $this->logDoneChange($user, $row, 'follow_up_done', $old);
+    91	
+    92	            return $row;
+    93	        });
+    94	    }
+    95	
+    96	    /** Undo: clears the done date. Audited. */
+    97	    public function undoFollowUpDone(User $user, ParentCommunication $c): ParentCommunication
+    98	    {
+    99	        return DB::transaction(function () use ($user, $c) {
+   100	            $row = $this->lockedAvailable($c);
+   101	
+   102	            if ($row->follow_up_done_at === null) {
+   103	                throw ValidationException::withMessages(['follow_up_done_at' => ['This follow-up is not marked done.']]);
+   104	            }
+   105	
+   106	            $old = $this->values($row);
+   107	            $row->follow_up_done_at = null;
+   108	            $row->save();
+   109	
+   110	            $this->logDoneChange($user, $row, 'follow_up_undone', $old);
+   111	
+   112	            return $row;
+   113	        });
+   114	    }
+   115	
+   116	    public function delete(User $user, ParentCommunication $c): void
+   117	    {
+   118	        DB::transaction(function () use ($user, $c) {
+   119	            AuditLogger::log($user, $c, 'deleted', $this->values($c), null);
+   120	            $c->delete();
+   121	        });
+   122	    }
+   123	
+   124	    public function restore(User $user, ParentCommunication $c): void
+   125	    {
+   126	        DB::transaction(function () use ($user, $c) {
+   127	            $c->restore();
+   128	            AuditLogger::log($user, $c, 'restored', null, $this->values($c));
+   129	        });
+   130	    }
+   131	
+   132	    public function listForStudent(User $user, Student $student, ?int $classId = null, bool $trashedOnly = false): Collection
+   133	    {
+   134	        Gate::forUser($user)->authorize('view', $student);
+   135	
+   136	        $rows = ($trashedOnly ? ParentCommunication::onlyTrashed() : ParentCommunication::query())
+   137	            ->where('student_id', $student->id)
+   138	            ->inActiveClasses()
+   139	            ->when($classId, fn ($q) => $q->where('class_assignment_id', $classId))
+   140	            ->when(! $user->isAdmin(), fn ($q) => $q->authoredBy($user->id))
+   141	            ->orderByDesc('contact_date')->orderByDesc('id')
+   142	            ->get();
+   143	
+   144	        $this->guard->auditAdminRead($user, $student, 'parent_communication', $rows->pluck('id')->all());
+   145	
+   146	        return $rows;
+   147	    }
+   148	
+   149	    /** The user's own parent-contact follow-ups that are due. Calculated, never stored. */
+   150	    public function due(User $user, ?string $today = null): Collection
+   151	    {
+   152	        $query = ParentCommunication::query()
+   153	            ->with('student')
+   154	            ->authoredBy($user->id)
+   155	            ->inActiveClasses()
+   156	            ->whereNotNull('follow_up_date')
+   157	            ->whereNull('follow_up_done_at')
+   158	            ->where('follow_up_date', '<=', $today ?? $this->guard->today());
+   159	
+   160	        return $this->scope->apply($query, $user)
+   161	            ->orderBy('follow_up_date')->orderBy('id')
+   162	            ->get();
+   163	    }
+   164	
+   165	    /**
+   166	     * Re-reads the row inside the transaction with a lock, so two tabs cannot both change it.
+   167	     * Deleted rows and rows of an archived class are not found.
+   168	     */
+   169	    private function lockedAvailable(ParentCommunication $c): ParentCommunication
+   170	    {
+   171	        $row = ParentCommunication::query()
+   172	            ->inActiveClasses()
+   173	            ->whereKey($c->getKey())
+   174	            ->lockForUpdate()
+   175	            ->first();
+   176	
+   177	        if (! $row) {
+   178	            throw ValidationException::withMessages(['communication' => ['This communication is not available.']]);
+   179	        }
+   180	
+   181	        return $row;
+   182	    }
+   183	
+   184	    /** The author's own change is a normal event; an admin acting on someone else's record is a correction. */
+   185	    private function logDoneChange(User $user, ParentCommunication $row, string $event, array $old): void
+   186	    {
+   187	        $event = $user->id === $row->author_id ? $event : 'admin_corrected';
+   188	
+   189	        AuditLogger::log($user, $row, $event, $old, $this->values($row) + ['follow_up_done_changed' => true]);
+   190	    }
+   191	
+   192	    /** The log records contact that already happened: no future contact date; follow-up not before it. */
+   193	    private function checkDates(array $data): void
+   194	    {
+   195	        $errors = [];
+   196	        if ($data['contact_date'] > $this->guard->today()) {
+   197	            $errors['contact_date'][] = 'The contact date cannot be in the future.';
+   198	        }
+   199	        if (! empty($data['follow_up_date']) && $data['follow_up_date'] < $data['contact_date']) {
+   200	            $errors['follow_up_date'][] = 'The follow-up date cannot be before the contact date.';
+   201	        }
+   202	        if (! in_array($data['method'] ?? null, InterventionVocabulary::keys('METHODS'), true)) {
+   203	            $errors['method'][] = 'Choose a valid contact method.';
+   204	        }
+   205	        if ($errors) {
+   206	            throw ValidationException::withMessages($errors);
+   207	        }
+   208	    }
+   209	
+   210	    private function values(ParentCommunication $c): array
+   211	    {
+   212	        return [
+   213	            'student_id' => $c->student_id,
+   214	            'class_assignment_id' => $c->class_assignment_id,
+   215	            'contact_date' => $c->contact_date?->format('Y-m-d'),
+   216	            'method' => $c->method,
+   217	            'follow_up_date' => $c->follow_up_date?->format('Y-m-d'),
+   218	            'follow_up_done_at' => $c->follow_up_done_at?->format('Y-m-d'),
+   219	        ];
+   220	    }
+   221	}
+===== app/Http/Controllers/Api/ParentCommunicationController.php
+     1	<?php
+     2	
+     3	namespace App\Http\Controllers\Api;
+     4	
+     5	use App\Http\Controllers\Api\Concerns\HandlesStudentRecords;
+     6	use App\Http\Controllers\Controller;
+     7	use App\Http\Requests\SaveParentCommunicationRequest;
+     8	use App\Http\Resources\ParentCommunicationResource;
+     9	use App\Http\Resources\ParentCommunicationSummaryResource;
+    10	use App\Models\ParentCommunication;
+    11	use App\Models\Student;
+    12	use App\Services\ParentCommunicationService;
+    13	use App\Services\StudentRecordGuard;
+    14	use Illuminate\Http\Request;
+    15	
+    16	/** Log of parent contact the teacher already made. It sends nothing. */
+    17	class ParentCommunicationController extends Controller
+    18	{
+    19	    use HandlesStudentRecords;
+    20	
+    21	    public function __construct(private ParentCommunicationService $service, private StudentRecordGuard $guard) {}
+    22	
+    23	    /** List rows have no reason or summary text. */
+    24	    public function index(Request $request, Student $student)
+    25	    {
+    26	        $this->authorize('view', $student);
+    27	        $request->validate([
+    28	            'class_assignment_id' => ['nullable', 'integer'],
+    29	            'trashed' => ['nullable', 'in:only'],
+    30	        ]);
+    31	
+    32	        $rows = $this->service->listForStudent(
+    33	            $request->user(),
+    34	            $student,
+    35	            $request->integer('class_assignment_id') ?: null,
+    36	            $request->query('trashed') === 'only'
+    37	        );
+    38	
+    39	        return ParentCommunicationSummaryResource::collection($this->withContext($rows, $request));
+    40	    }
+    41	
+    42	    public function store(SaveParentCommunicationRequest $request, Student $student)
+    43	    {
+    44	        $this->authorize('create', ParentCommunication::class);
+    45	
+    46	        $comm = $this->service->create($request->user(), $student, $request->validated());
+    47	
+    48	        return (new ParentCommunicationResource($this->withContext($comm, $request)))->response()->setStatusCode(201);
+    49	    }
+    50	
+    51	    public function show(Request $request, ParentCommunication $communication)
+    52	    {
+    53	        $this->authorize('view', $communication);
+    54	        $this->guard->auditAdminRead($request->user(), $communication->student, 'parent_communication', [$communication->id]);
+    55	
+    56	        return new ParentCommunicationResource($this->withContext($communication, $request));
+    57	    }
+    58	
+    59	    public function update(SaveParentCommunicationRequest $request, ParentCommunication $communication)
+    60	    {
+    61	        $this->authorize('update', $communication);
+    62	
+    63	        $this->service->update($request->user(), $communication, $request->validated());
+    64	
+    65	        return new ParentCommunicationResource($this->withContext($communication->refresh(), $request));
+    66	    }
+    67	
+    68	    public function destroy(Request $request, ParentCommunication $communication)
+    69	    {
+    70	        $this->authorize('delete', $communication);
+    71	        $this->service->delete($request->user(), $communication);
+    72	
+    73	        return response()->noContent();
+    74	    }
+    75	
+    76	    public function restore(Request $request, ParentCommunication $communication)
+    77	    {
+    78	        $this->authorize('restore', $communication);
+    79	
+    80	        if (! $communication->trashed()) {
+    81	            return $this->notDeletedResponse('communication');
+    82	        }
+    83	
+    84	        $this->service->restore($request->user(), $communication);
+    85	
+    86	        return new ParentCommunicationResource($this->withContext($communication->refresh(), $request));
+    87	    }
+    88	        public function markFollowUpDone(Request $request, ParentCommunication $communication)
+    89	    {
+    90	        $this->authorize('update', $communication);
+    91	
+    92	        $row = $this->service->markFollowUpDone($request->user(), $communication);
+    93	
+    94	        return new ParentCommunicationResource($this->withContext($row, $request));
+    95	    }
+    96	
+    97	    public function undoFollowUpDone(Request $request, ParentCommunication $communication)
+    98	    {
+    99	        $this->authorize('update', $communication);
+   100	
+   101	        $row = $this->service->undoFollowUpDone($request->user(), $communication);
+   102	
+   103	        return new ParentCommunicationResource($this->withContext($row, $request));
+   104	    }
+   105	}
+===== app/Http/Controllers/Concerns/HandlesStudentRecords.php
+cat: app/Http/Controllers/Concerns/HandlesStudentRecords.php: No such file or directory
+===== app/Http/Resources/Concerns/PresentsRecords.php
+     1	<?php
+     2	
+     3	namespace App\Http\Resources\Concerns;
+     4	
+     5	use App\Support\InterventionStatus;
+     6	use Carbon\Carbon;
+     7	use Illuminate\Http\Request;
+     8	
+     9	/** Small helpers shared by the notes, interventions and communications resources. */
+    10	trait PresentsRecords
+    11	{
+    12	    /** School "today" (never APP_TIMEZONE). */
+    13	    protected function schoolToday(): string
+    14	    {
+    15	        return Carbon::now(config('monitoring.timezone'))->toDateString();
+    16	    }
+    17	
+    18	    /** The class, or null for a general record. Needs classAssignment.section.gradeLevel + subject eager loaded. */
+    19	    protected function classInfo(): ?array
+    20	    {
+    21	        $ca = $this->resource->relationLoaded('classAssignment') ? $this->resource->classAssignment : null;
+    22	        if (! $ca) {
+    23	            return null;
+    24	        }
+    25	
+    26	        $grade = $ca->section?->gradeLevel?->name;
+    27	        $section = $ca->section?->name;
+    28	
+    29	        return [
+    30	            'id' => $ca->id,
+    31	            'label' => trim(($grade ? "$grade - " : '') . $section),
+    32	            'subject' => $ca->subject?->name,
+    33	        ];
+    34	    }
+    35	
+    36	    /** overdue | due_today | upcoming, or null when there is no active due date. Calculated, never stored. */
+    37	    protected function followUpState(?string $date, ?string $status): ?string
+    38	    {
+    39	        if ($date === null || $status === InterventionStatus::COMPLETED) {
+    40	            return null;
+    41	        }
+    42	        $today = $this->schoolToday();
+    43	
+    44	        return $date < $today ? 'overdue' : ($date === $today ? 'due_today' : 'upcoming');
+    45	    }
+    46	        /** done | overdue | due_today | upcoming, or null with no follow-up date. Calculated, never stored. */
+    47	    protected function communicationFollowUpState(?string $date, ?string $doneAt): ?string
+    48	    {
+    49	        if ($date === null) {
+    50	            return null;
+    51	        }
+    52	        if ($doneAt !== null) {
+    53	            return 'done';
+    54	        }
+    55	        $today = $this->schoolToday();
+    56	
+    57	        return $date < $today ? 'overdue' : ($date === $today ? 'due_today' : 'upcoming');
+    58	    }
+    59	
+    60	    /** Only admins see who wrote a record (teachers only ever see their own). */
+    61	    protected function authorName(Request $request): ?string
+    62	    {
+    63	        return $request->user()?->isAdmin() ? $this->resource->author?->name : null;
+    64	    }
+    65	
+    66	    protected function ymd($value): ?string
+    67	    {
+    68	        return $value?->format('Y-m-d');
+    69	    }
+    70	}
+===== app/Policies/AuthoredRecordPolicy.php
+     1	<?php
+     2	
+     3	namespace App\Policies;
+     4	
+     5	use App\Models\ClassAssignment;
+     6	use App\Models\User;
+     7	use Illuminate\Database\Eloquent\Model;
+     8	
+     9	/**
+    10	 * Rules shared by notes, interventions and parent communications.
+    11	 * There is deliberately NO before(): admins are not let through blindly, because records of an
+    12	 * archived class are hidden from everyone, admins included.
+    13	 *
+    14	 * A record is accessible when ALL hold:
+    15	 *  1. the user is an admin or the author of the record;
+    16	 *  2. the record's class (if any) is active, i.e. not archived;
+    17	 *  3. the student is visible to the user (StudentPolicy::view; admins pass).
+    18	 * view / update / delete / restore all use the same rule.
+    19	 */
+    20	abstract class AuthoredRecordPolicy
+    21	{
+    22	    public function viewAny(User $user): bool
+    23	    {
+    24	        return $user->isAdmin() || $user->isTeacher();
+    25	    }
+    26	
+    27	    /** Creating: the student and class checks need the payload, so StudentRecordGuard does them. */
+    28	    public function create(User $user): bool
+    29	    {
+    30	        return $user->isAdmin() || $user->isTeacher();
+    31	    }
+    32	
+    33	    public function view(User $user, Model $record): bool
+    34	    {
+    35	        return $this->canAccess($user, $record);
+    36	    }
+    37	
+    38	    public function update(User $user, Model $record): bool
+    39	    {
+    40	        return $this->canAccess($user, $record);
+    41	    }
+    42	
+    43	    public function delete(User $user, Model $record): bool
+    44	    {
+    45	        return $this->canAccess($user, $record);
+    46	    }
+    47	
+    48	    public function restore(User $user, Model $record): bool
+    49	    {
+    50	        return $this->canAccess($user, $record);
+    51	    }
+    52	
+    53	    protected function canAccess(User $user, Model $record): bool
+    54	    {
+    55	        if (! $user->isAdmin() && $record->author_id !== $user->id) {
+    56	            return false;
+    57	        }
+    58	
+    59	        if (! $this->classIsAvailable($record)) {
+    60	            return false;
+    61	        }
+    62	
+    63	        $student = $record->student;
+    64	
+    65	        return $student !== null && $user->can('view', $student);
+    66	    }
+    67	
+    68	    /** No class = always available. Archived classes are soft-deleted, so the default scope leaves them out. */
+    69	    private function classIsAvailable(Model $record): bool
+    70	    {
+    71	        if ($record->class_assignment_id === null) {
+    72	            return true;
+    73	        }
+    74	
+    75	        return ClassAssignment::query()
+    76	            ->whereKey($record->class_assignment_id)
+    77	            ->where('status', 'active')
+    78	            ->exists();
+    79	    }
+    80	}
+===== app/Policies/ParentCommunicationPolicy.php
+     1	<?php
+     2	
+     3	namespace App\Policies;
+     4	
+     5	/**
+     6	 * Intentionally has no methods of its own: every rule is inherited from AuthoredRecordPolicy.
+     7	 */
+     8	class ParentCommunicationPolicy extends AuthoredRecordPolicy
+     9	{
+    10	}
+===== app/Services/InterventionService.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\Intervention;
+     6	use App\Models\InterventionFollowup;
+     7	use App\Models\Student;
+     8	use App\Models\User;
+     9	use App\Support\InterventionStatus;
+    10	use Illuminate\Support\Arr;
+    11	use Illuminate\Support\Collection;
+    12	use Illuminate\Support\Facades\DB;
+    13	use Illuminate\Support\Facades\Gate;
+    14	use Illuminate\Validation\ValidationException;
+    15	
+    16	/**
+    17	 * Interventions and their follow-up history. Operational tracking only; nothing here is a grade or a verdict.
+    18	 * This is the only place that changes status, follow_up_date or outcome.
+    19	 * Audit values hold ids, statuses, dates and "text changed" flags, never free text.
+    20	 */
+    21	class InterventionService
+    22	{
+    23	    public const OUTCOMES = ['improved', 'partly_improved', 'no_change', 'not_yet_known'];
+    24	
+    25	    public function __construct(private StudentRecordGuard $guard, private TeacherStudentScope $scope) {}
+    26	
+    27	    // ---------------------------------------------------------------- create / edit
+    28	
+    29	    public function create(User $user, Student $student, array $data): Intervention
+    30	    {
+    31	        $classId = ! empty($data['class_assignment_id']) ? (int) $data['class_assignment_id'] : null;
+    32	        $this->guard->assertContext($user, $student, $classId);
+    33	
+    34	        $followUp = $data['follow_up_date'] ?? null;
+    35	        if ($followUp && $followUp < $data['intervention_date']) {
+    36	            throw ValidationException::withMessages(['follow_up_date' => ['The follow-up date cannot be before the intervention date.']]);
+    37	        }
+    38	
+    39	        return DB::transaction(function () use ($user, $student, $data, $classId, $followUp) {
+    40	            $i = new Intervention(Arr::only($data, ['concern_type', 'concern', 'intervention_type', 'intervention_date', 'notes']));
+    41	            // Server-controlled fields: never taken from the request.
+    42	            $i->student_id = $student->id;
+    43	            $i->class_assignment_id = $classId;
+    44	            $i->author_id = $user->id;
+    45	            $i->status = InterventionStatus::PLANNED;
+    46	            $i->follow_up_date = $followUp;
+    47	            $i->save();
+    48	
+    49	            AuditLogger::log($user, $i, 'created', null, $this->values($i));
+    50	
+    51	            return $i;
+    52	        });
+    53	    }
+    54	
+    55	    /**
+    56	     * Edit the descriptive fields only. Status, follow-up date and outcome change through addEntry().
+    57	     * An admin editing someone else's record is logged as "admin_corrected".
+    58	     */
+    59	    public function update(User $user, Intervention $i, array $data): Intervention
+    60	    {
+    61	        $date = $data['intervention_date'];
+    62	        $errors = [];
+    63	
+    64	        if ($i->follow_up_date && $i->follow_up_date->format('Y-m-d') < $date) {
+    65	            $errors['intervention_date'][] = 'The intervention date cannot be after the current follow-up date.';
+    66	        }
+    67	        $earliest = InterventionFollowup::where('intervention_id', $i->id)->min('followup_date');
+    68	        if ($earliest && substr((string) $earliest, 0, 10) < $date) {
+    69	            $errors['intervention_date'][] = 'Some follow-up entries are dated before this date. Correct those first.';
+    70	        }
+    71	        if ($errors) {
+    72	            throw ValidationException::withMessages($errors);
+    73	        }
+    74	
+    75	        $payload = Arr::only($data, ['concern_type', 'concern', 'intervention_type', 'intervention_date', 'notes']);
+    76	        $flags = [
+    77	            'concern_changed' => array_key_exists('concern', $payload) && $payload['concern'] !== $i->concern,
+    78	            'notes_changed' => array_key_exists('notes', $payload) && $payload['notes'] !== $i->notes,
+    79	        ];
+    80	        $old = $this->values($i);
+    81	
+    82	        return DB::transaction(function () use ($user, $i, $payload, $old, $flags) {
+    83	            $i->update($payload);
+    84	            $event = $user->id === $i->author_id ? 'updated' : 'admin_corrected';
+    85	            AuditLogger::log($user, $i, $event, $old, $this->values($i->refresh()) + $flags);
+    86	
+    87	            return $i;
+    88	        });
+    89	    }
+    90	
+    91	    // ---------------------------------------------------------------- follow-up entries
+    92	
+    93	    /**
+    94	     * Record one event on an intervention: a follow-up, a reschedule, a completion or a reopen.
+    95	     * Data: followup_date (required), kind ('followup' default | 'reschedule'), to_status (default: keep),
+    96	     *       progress, notes, next_follow_up_date, outcome (to complete), expected_status (stale-request guard).
+    97	     * The entry type is decided here from the transition, never taken from the client.
+    98	     */
+    99	    public function addEntry(User $user, Intervention $intervention, array $data): InterventionFollowup
+   100	    {
+   101	        $today = $this->guard->today();
+   102	
+   103	        return DB::transaction(function () use ($user, $intervention, $data, $today) {
+   104	            // Lock the row so two requests cannot both act on the same old status.
+   105	            $i = Intervention::query()->lockForUpdate()->find($intervention->id);
+   106	            if (! $i) {
+   107	                throw ValidationException::withMessages(['intervention' => ['This intervention was deleted.']]);
+   108	            }
+   109	
+   110	            $from = $i->status;
+   111	            $expected = $data['expected_status'] ?? null;
+   112	            if ($expected !== null && $expected !== $from) {
+   113	                throw ValidationException::withMessages(['status' => ['This intervention changed since you opened it. Reload and try again.']]);
+   114	            }
+   115	
+   116	            $kind = $data['kind'] ?? 'followup';
+   117	            $to = $kind === 'reschedule' ? $from : ($data['to_status'] ?? $from);
+   118	            $date = $data['followup_date'];
+   119	            $next = $data['next_follow_up_date'] ?? null;
+   120	            $notes = trim((string) ($data['notes'] ?? ''));
+   121	            $errors = [];
+   122	
+   123	            if (! in_array($kind, ['followup', 'reschedule'], true)) {
+   124	                $errors['kind'][] = 'Unknown entry kind.';
+   125	            }
+   126	            if ($date > $today) {
+   127	                $errors['followup_date'][] = 'The date cannot be in the future.';
+   128	            }
+   129	            if ($date < $i->intervention_date->format('Y-m-d')) {
+   130	                $errors['followup_date'][] = 'The date cannot be before the intervention date.';
+   131	            }
+   132	
+   133	            // Transition rules (one table in InterventionStatus).
+   134	            if (! in_array($to, InterventionStatus::ALL, true)) {
+   135	                $errors['to_status'][] = 'Unknown status.';
+   136	            } elseif ($to === $from) {
+   137	                $stays = $kind === 'reschedule'
+   138	                    ? $from !== InterventionStatus::COMPLETED
+   139	                    : in_array($from, [InterventionStatus::IN_PROGRESS, InterventionStatus::REQUIRES_FOLLOW_UP], true);
+   140	                if (! $stays) {
+   141	                    $errors['to_status'][] = 'This intervention is ' . InterventionStatus::label($from) . ' and must move to a new status.';
+   142	                }
+   143	            } elseif (! InterventionStatus::canMove($from, $to)) {
+   144	                $errors['to_status'][] = 'Cannot change from ' . InterventionStatus::label($from) . ' to ' . InterventionStatus::label($to) . '.';
+   145	            }
+   146	
+   147	            $complete = $to === InterventionStatus::COMPLETED && $from !== InterventionStatus::COMPLETED;
+   148	            $reopen = $from === InterventionStatus::COMPLETED && $to === InterventionStatus::IN_PROGRESS;
+   149	
+   150	            if ($complete) {
+   151	                if (empty($data['outcome']) || ! in_array($data['outcome'], self::OUTCOMES, true)) {
+   152	                    $errors['outcome'][] = 'An outcome is required to complete an intervention.';
+   153	                }
+   154	                $next = null; // Completed clears the active due date.
+   155	            }
+   156	            if ($reopen && $notes === '') {
+   157	                $errors['notes'][] = 'A reason is required to reopen an intervention.';
+   158	            }
+   159	            if ($to === InterventionStatus::REQUIRES_FOLLOW_UP) {
+   160	                if ($notes === '') $errors['notes'][] = 'A reason is required for Requires Follow-up.';
+   161	                if ($next === null) $errors['next_follow_up_date'][] = 'A next follow-up date is required for Requires Follow-up.';
+   162	            }
+   163	            if ($kind === 'reschedule' && $next === null) {
+   164	                $errors['next_follow_up_date'][] = 'A new follow-up date is required to reschedule.';
+   165	            }
+   166	            if ($next !== null && $next <= $date) {
+   167	                $errors['next_follow_up_date'][] = 'The next follow-up date must be after the date of this entry.';
+   168	            }
+   169	
+   170	            if ($errors) {
+   171	                throw ValidationException::withMessages($errors);
+   172	            }
+   173	
+   174	            $type = $complete ? InterventionFollowup::TYPE_COMPLETED
+   175	                : ($reopen ? InterventionFollowup::TYPE_REOPENED
+   176	                : ($kind === 'reschedule' ? InterventionFollowup::TYPE_RESCHEDULED : InterventionFollowup::TYPE_FOLLOWUP));
+   177	
+   178	            $old = $this->state($i);
+   179	
+   180	            $entry = InterventionFollowup::create([
+   181	                'intervention_id' => $i->id,
+   182	                'author_id' => $user->id,
+   183	                'entry_type' => $type,
+   184	                'followup_date' => $date,
+   185	                'from_status' => $from,
+   186	                'to_status' => $to,
+   187	                'progress' => $kind === 'reschedule' ? null : ($data['progress'] ?? null),
+   188	                'notes' => $notes !== '' ? $notes : null,
+   189	                'next_follow_up_date' => $next,
+   190	                'outcome' => $complete ? $data['outcome'] : null, // the history keeps what was concluded, even after a reopen
+   191	            ]);
+   192	
+   193	            $i->status = $to;
+   194	            $i->follow_up_date = $next;
+   195	            if ($complete) $i->outcome = $data['outcome'];
+   196	            if ($reopen) $i->outcome = null; // the earlier outcome stays in the audit log
+   197	            $i->save();
+   198	
+   199	            $event = [
+   200	                InterventionFollowup::TYPE_FOLLOWUP => 'followup_recorded',
+   201	                InterventionFollowup::TYPE_RESCHEDULED => 'rescheduled',
+   202	                InterventionFollowup::TYPE_COMPLETED => 'completed',
+   203	                InterventionFollowup::TYPE_REOPENED => 'reopened',
+   204	            ][$type];
+   205	
+   206	            AuditLogger::log($user, $i, $event, $old, $this->state($i->refresh()) + [
+   207	                'followup_id' => $entry->id,
+   208	                'by_admin' => $user->id !== $i->author_id,
+   209	            ]);
+   210	
+   211	            return $entry;
+   212	        });
+   213	    }
+   214	
+   215	    // ---------------------------------------------------------------- delete / restore
+   216	
+   217	    public function delete(User $user, Intervention $i): void
+   218	    {
+   219	        DB::transaction(function () use ($user, $i) {
+   220	            AuditLogger::log($user, $i, 'deleted', $this->values($i), null);
+   221	            $i->delete();
+   222	        });
+   223	    }
+   224	
+   225	    public function restore(User $user, Intervention $i): void
+   226	    {
+   227	        DB::transaction(function () use ($user, $i) {
+   228	            $i->restore();
+   229	            AuditLogger::log($user, $i, 'restored', null, $this->values($i));
+   230	        });
+   231	    }
+   232	
+   233	    // ---------------------------------------------------------------- reading
+   234	
+   235	    /**
+   236	     * Interventions for a student. Teachers see their own; admins see all authors (one audit row per request).
+   237	     * Archived-class records are excluded for everyone.
+   238	     */
+   239	    public function listForStudent(User $user, Student $student, ?int $classId = null, bool $trashedOnly = false): Collection
+   240	    {
+   241	        Gate::forUser($user)->authorize('view', $student);
+   242	
+   243	        $rows = ($trashedOnly ? Intervention::onlyTrashed() : Intervention::query())
+   244	            ->where('student_id', $student->id)
+   245	            ->inActiveClasses()
+   246	            ->when($classId, fn ($q) => $q->where('class_assignment_id', $classId))
+   247	            ->when(! $user->isAdmin(), fn ($q) => $q->authoredBy($user->id))
+   248	            ->orderByDesc('intervention_date')->orderByDesc('id')
+   249	            ->get();
+   250	
+   251	        $this->guard->auditAdminRead($user, $student, 'intervention', $rows->pluck('id')->all());
+   252	
+   253	        return $rows;
+   254	    }
+   255	
+   256	    /**
+   257	     * The user's own follow-ups that are due (follow_up_date <= today in the school timezone, not Completed,
+   258	     * not deleted, not in an archived class). Calculated on request, never stored. Reused later by the
+   259	     * dashboard and notifications.
+   260	     */
+   261	    public function due(User $user, ?string $today = null): Collection
+   262	    {
+   263	        $query = Intervention::query()
+   264	            ->with('student')
+   265	            ->authoredBy($user->id)
+   266	            ->inActiveClasses()
+   267	            ->due($today ?? $this->guard->today());
+   268	
+   269	        // The student must still be in one of the user's active classes, like the all-interventions list.
+   270	        return $this->scope->apply($query, $user)
+   271	            ->orderBy('follow_up_date')->orderBy('id')
+   272	            ->get();
+   273	    }
+   274	
+   275	    // ---------------------------------------------------------------- internals
+   276	
+   277	    private function state(Intervention $i): array
+   278	    {
+   279	        return [
+   280	            'status' => $i->status,
+   281	            'follow_up_date' => $i->follow_up_date?->format('Y-m-d'),
+   282	            'outcome' => $i->outcome,
+   283	        ];
+   284	    }
+   285	
+   286	    private function values(Intervention $i): array
+   287	    {
+   288	        return [
+   289	            'student_id' => $i->student_id,
+   290	            'class_assignment_id' => $i->class_assignment_id,
+   291	            'concern_type' => $i->concern_type,
+   292	            'intervention_type' => $i->intervention_type,
+   293	            'intervention_date' => $i->intervention_date?->format('Y-m-d'),
+   294	        ] + $this->state($i);
+   295	    }
+   296	}
+===== app/Services/InterventionListService.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\Intervention;
+     6	use App\Models\User;
+     7	use Illuminate\Pagination\LengthAwarePaginator;
+     8	
+     9	/**
+    10	 * The signed-in teacher's own interventions across all of their students, so a teacher can find
+    11	 * completed (or active) interventions without opening each student.
+    12	 *
+    13	 * Same visibility rules as everywhere else in the module:
+    14	 *  - only records the user wrote (admins have none of their own, so they get an empty list);
+    15	 *  - records of an archived class are left out;
+    16	 *  - the student must still be visible to the teacher (enrolled in one of the teacher's active classes),
+    17	 *    which is the rule StudentPolicy::view applies, so a listed record can always be opened.
+    18	 * Rows carry no free text; the text stays in the detail endpoint.
+    19	 */
+    20	class InterventionListService
+    21	{
+    22	    public function paginate(User $user, array $filters, int $perPage = 25): LengthAwarePaginator
+    23	    {
+    24	        $query = Intervention::query()
+    25	            ->authoredBy($user->id)
+    26	            ->inActiveClasses()
+    27	            ->with(['student', 'classAssignment.section.gradeLevel', 'classAssignment.subject'])
+    28	            // The date of the latest "completed" history entry (a reopened case may be completed again).
+    29	            ->withMax(['followups as completed_on' => fn ($q) => $q->where('entry_type', 'completed')], 'followup_date');
+    30	
+    31	        $teacher = $user->teacher;
+    32	        if ($teacher) {
+    33	            $classIds = $teacher->classAssignments()->pluck('id'); // archived classes are soft-deleted, so excluded
+    34	            $query->whereHas('student', fn ($s) => $s->whereHas(
+    35	                'enrollments',
+    36	                fn ($e) => $e->whereIn('class_assignment_id', $classIds)
+    37	            ));
+    38	        } else {
+    39	            $query->whereRaw('1 = 0');
+    40	        }
+    41	
+    42	        $status = $filters['status'] ?? null;
+    43	        if ($status === 'active') {
+    44	            $query->active();
+    45	        } elseif ($status) {
+    46	            $query->where('status', $status);
+    47	        }
+    48	
+    49	        if (! empty($filters['class_assignment_id'])) {
+    50	            $query->where('class_assignment_id', (int) $filters['class_assignment_id']);
+    51	        }
+    52	        if (! empty($filters['concern_type'])) {
+    53	            $query->where('concern_type', $filters['concern_type']);
+    54	        }
+    55	        if (! empty($filters['outcome'])) {
+    56	            $query->where('outcome', $filters['outcome']);
+    57	        }
+    58	
+    59	        if (! empty($filters['search'])) {
+    60	            $term = '%' . addcslashes($filters['search'], '%_\\') . '%';
+    61	            $query->whereHas('student', fn ($s) => $s->where(
+    62	                fn ($w) => $w->whereRaw("CONCAT(first_name, ' ', last_name) LIKE ?", [$term])
+    63	                    ->orWhere('student_id', 'like', $term)
+    64	            ));
+    65	        }
+    66	
+    67	        // Completed: most recently completed first. Everything else: newest intervention first.
+    68	        if ($status === 'completed') {
+    69	            $query->orderByDesc('completed_on')->orderByDesc('id');
+    70	        } else {
+    71	            $query->orderByDesc('intervention_date')->orderByDesc('id');
+    72	        }
+    73	
+    74	        return $query->paginate($perPage);
+    75	    }
+    76	}
+===== app/Http/Controllers/Api/FollowUpController.php
+     1	<?php
+     2	
+     3	namespace App\Http\Controllers\Api;
+     4	
+     5	use App\Http\Controllers\Api\Concerns\HandlesStudentRecords;
+     6	use App\Http\Controllers\Controller;
+     7	use App\Http\Resources\DueCommunicationFollowUpResource;
+     8	use App\Http\Resources\DueFollowUpResource;
+     9	use App\Models\Intervention;
+    10	use App\Services\InterventionService;
+    11	use App\Services\ParentCommunicationService;
+    12	use App\Services\StudentRecordGuard;
+    13	use Illuminate\Http\Request;
+    14	
+    15	class FollowUpController extends Controller
+    16	{
+    17	    use HandlesStudentRecords;
+    18	
+    19	    public function __construct(
+    20	        private InterventionService $service,
+    21	        private ParentCommunicationService $communications,
+    22	        private StudentRecordGuard $guard,
+    23	    ) {}
+    24	
+    25	    /**
+    26	     * The signed-in user's own follow-ups that are due (follow_up_date <= today in the school timezone,
+    27	     * not completed or done, not deleted, not in an archived class, student still in the user's classes).
+    28	     * Interventions and parent-contact follow-ups come in one list, told apart by "kind".
+    29	     * Rows carry no free text. Also the query the dashboard and notifications will reuse.
+    30	     */
+    31	    public function due(Request $request)
+    32	    {
+    33	        $this->authorize('viewAny', Intervention::class);
+    34	
+    35	        $user = $request->user();
+    36	        $today = $this->guard->today();
+    37	        $relations = ['classAssignment.section.gradeLevel', 'classAssignment.subject'];
+    38	
+    39	        $interventions = $this->service->due($user, $today)->load($relations);
+    40	        $communications = $this->communications->due($user, $today)->load($relations);
+    41	
+    42	        $rows = $interventions
+    43	            ->map(fn ($r) => (new DueFollowUpResource($r))->resolve($request))
+    44	            ->concat($communications->map(fn ($r) => (new DueCommunicationFollowUpResource($r))->resolve($request)))
+    45	            ->sortBy([['follow_up_date', 'asc'], ['kind', 'asc'], ['id', 'asc']])
+    46	            ->values();
+    47	
+    48	        return response()->json(['data' => $rows, 'meta' => ['today' => $today]]);
+    49	    }
+    50	}
+===== app/Http/Resources/DueFollowUpResource.php
+     1	<?php
+     2	
+     3	namespace App\Http\Resources;
+     4	
+     5	use App\Http\Resources\Concerns\PresentsRecords;
+     6	use App\Support\InterventionStatus;
+     7	use App\Support\InterventionVocabulary;
+     8	use Illuminate\Http\Request;
+     9	use Illuminate\Http\Resources\Json\JsonResource;
+    10	
+    11	/** A follow-up that needs attention. No free text; the teacher opens the intervention for details. */
+    12	class DueFollowUpResource extends JsonResource
+    13	{
+    14	    use PresentsRecords;
+    15	
+    16	    public function toArray(Request $request): array
+    17	    {
+    18	        $followUp = $this->ymd($this->follow_up_date);
+    19	
+    20	        return [
+    21	            'id' => $this->id,
+    22	            'kind' => 'intervention',
+    23	            'student' => [
+    24	                'id' => $this->student->id,
+    25	                'student_number' => $this->student->student_id,
+    26	                'full_name' => $this->student->full_name,
+    27	            ],
+    28	            'class' => $this->classInfo(),
+    29	            'concern_type_label' => InterventionVocabulary::label('CONCERN_TYPES', $this->concern_type),
+    30	            'follow_up_date' => $followUp,
+    31	            'follow_up_state' => $this->followUpState($followUp, $this->status),
+    32	            'status' => $this->status,
+    33	            'status_label' => InterventionStatus::label($this->status),
+    34	        ];
+    35	    }
+    36	}
+===== app/Services/AuditLogger.php
+     1	<?php
+     2	
+     3	namespace App\Services;
+     4	
+     5	use App\Models\AuditLog;
+     6	use App\Models\User;
+     7	use Illuminate\Database\Eloquent\Model;
+     8	
+     9	class AuditLogger
+    10	{
+    11	    public static function log(User $user, Model $model, string $event, ?array $old, ?array $new): void
+    12	    {
+    13	        AuditLog::create([
+    14	            'user_id' => $user->id,
+    15	            'auditable_type' => $model::class,
+    16	            'auditable_id' => $model->getKey(),
+    17	            'event' => $event,
+    18	            'old_values' => $old,
+    19	            'new_values' => $new,
+    20	            'ip_address' => request()->ip(),
+    21	        ]);
+    22	    }
+    23	}===== routes/api.php (parent-communications and follow-ups)
+61:    Route::get('/follow-ups/due', [FollowUpController::class, 'due']);
+78:    Route::get('/students/{student}/parent-communications', [ParentCommunicationController::class, 'index']);
+79:    Route::post('/students/{student}/parent-communications', [ParentCommunicationController::class, 'store']);
+80:    Route::get('/parent-communications/{communication}', [ParentCommunicationController::class, 'show']);
+81:    Route::put('/parent-communications/{communication}', [ParentCommunicationController::class, 'update']);
+82:    Route::delete('/parent-communications/{communication}', [ParentCommunicationController::class, 'destroy']);
+83:    Route::post('/parent-communications/{communication}/restore', [ParentCommunicationController::class, 'restore'])->withTrashed();
+84:    Route::post('/parent-communications/{communication}/follow-up-done', [ParentCommunicationController::class, 'markFollowUpDone']);
+85:    Route::delete('/parent-communications/{communication}/follow-up-done', [ParentCommunicationController::class, 'undoFollowUpDone']);
+===== migration (parent_communications table)
+grep: database/migrations/2026_10_15_000001_create_intervention_tables.php: No such file or directory
+===== tests/Feature/InterventionModuleTest.php (first 120 lines)
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\AcademicYear;
+use App\Models\AuditLog;
+use App\Models\ClassAssignment;
+use App\Models\Enrollment;
+use App\Models\GradeLevel;
+use App\Models\Intervention;
+use App\Models\InterventionFollowup;
+use App\Models\ParentCommunication;
+use App\Models\Section;
+use App\Models\Student;
+use App\Models\StudentNote;
+use App\Models\Subject;
+use App\Models\Teacher;
+use App\Models\User;
+use App\Services\InterventionService;
+use App\Services\ParentCommunicationService;
+use App\Services\StudentNoteService;
+use Carbon\Carbon;
+use Illuminate\Auth\Access\AuthorizationException;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+use PHPUnit\Framework\Attributes\DataProvider;
+use RuntimeException;
+use Tests\TestCase;
+
+/**
+ * Notes, interventions, follow-ups and parent communications: service and policy rules.
+ * These tests call the services and policies directly (the HTTP routes come in the API step).
+ * "Today" is fixed at 2030-03-10 (school timezone). RefreshDatabase wipes the database, so this
+ * refuses to run unless it is a *_test MySQL database (no :memory: here).
+ */
+class InterventionModuleTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private const TZ = 'Asia/Manila';
+
+    private User $owner;      // teacher who owns $class
+    private User $other;      // teacher of $classOther; also teaches student1
+    private User $outsider;   // teacher with no classes
+    private User $admin;
+    private ClassAssignment $class;
+    private ClassAssignment $classOther;
+    private Student $student1;   // enrolled in both classes
+    private int $seq = 0;
+
+    protected function beforeRefreshingDatabase(): void
+    {
+        $db = (string) config('database.connections.' . config('database.default') . '.database');
+        if (! str_ends_with($db, '_test')) {
+            throw new RuntimeException("Refusing to wipe '$db'. Point phpunit.xml at a database whose name ends in _test.");
+        }
+    }
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->owner = $this->makeUser('teacher', 'owner@test.local');
+        $this->other = $this->makeUser('teacher', 'other@test.local');
+        $this->outsider = $this->makeUser('teacher', 'outsider@test.local');
+        $this->admin = $this->makeUser('admin', 'admin@test.local');
+        $ownerProfile = Teacher::create(['user_id' => $this->owner->id, 'employee_id' => 'T-OWNER']);
+        $otherProfile = Teacher::create(['user_id' => $this->other->id, 'employee_id' => 'T-OTHER']);
+        Teacher::create(['user_id' => $this->outsider->id, 'employee_id' => 'T-OUT']);
+
+        $year = AcademicYear::create(['name' => '2030-2031', 'start_date' => '2030-01-01', 'end_date' => '2030-12-31', 'is_active' => true]);
+        $grade = GradeLevel::create(['name' => 'Grade 8', 'order' => 8]);
+        $math = Subject::create(['name' => 'Mathematics', 'code' => 'MATH']);
+        $science = Subject::create(['name' => 'Science', 'code' => 'SCI']);
+        $section = Section::create(['name' => 'Mabini', 'grade_level_id' => $grade->id, 'academic_year_id' => $year->id]);
+
+        $this->class = ClassAssignment::create([
+            'teacher_id' => $ownerProfile->id, 'subject_id' => $math->id,
+            'section_id' => $section->id, 'academic_year_id' => $year->id, 'status' => 'active',
+        ]);
+        $this->classOther = ClassAssignment::create([
+            'teacher_id' => $otherProfile->id, 'subject_id' => $science->id,
+            'section_id' => $section->id, 'academic_year_id' => $year->id, 'status' => 'active',
+        ]);
+
+        $this->student1 = $this->student($this->class);
+        Enrollment::create([
+            'student_id' => $this->student1->id, 'class_assignment_id' => $this->classOther->id,
+            'section_id' => $section->id, 'academic_year_id' => $year->id,
+        ]);
+
+        // After the fixtures: "now" is 10 March 2030, mid-morning in Manila.
+        $this->travelTo(Carbon::parse('2030-03-10 10:00:00', self::TZ));
+    }
+
+    // ================================================================ status transitions
+
+    public static function allowedTransitions(): array
+    {
+        return [
+            'planned to in progress' => ['planned', 'in_progress'],
+            'planned to completed' => ['planned', 'completed'],
+            'in progress to requires follow-up' => ['in_progress', 'requires_follow_up'],
+            'in progress to completed' => ['in_progress', 'completed'],
+            'requires follow-up to in progress' => ['requires_follow_up', 'in_progress'],
+            'requires follow-up to completed' => ['requires_follow_up', 'completed'],
+            'completed to in progress (reopen)' => ['completed', 'in_progress'],
+            'in progress stays in progress' => ['in_progress', 'in_progress'],
+            'requires follow-up stays' => ['requires_follow_up', 'requires_follow_up'],
+        ];
+    }
+
+    #[DataProvider('allowedTransitions')]
+    public function test_allowed_transitions(string $from, string $to): void
+    {
+        $i = $this->reach($this->make($this->owner), $from);
+        $history = InterventionFollowup::count();
+        $audits = AuditLog::count();
+
