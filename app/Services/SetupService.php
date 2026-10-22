@@ -8,6 +8,7 @@ use App\Models\Subject;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use App\Models\StudentGradeLevel;
@@ -52,6 +53,9 @@ class SetupService
         DB::transaction(function () use ($item, $user) {
             AuditLogger::log($user, $item, 'deleted', $this->values($item), null);
             $item->delete();
+            if ($item instanceof GradeLevel) {
+                Cache::forget('grade_levels');
+            }
         });
     }
 
@@ -76,6 +80,10 @@ class SetupService
     /** The app expects a single active academic year. */
     private function afterSave(Model $item): void
     {
+        if ($item instanceof GradeLevel) {
+            Cache::forget('grade_levels');
+        }
+
         if ($item instanceof AcademicYear && $item->is_active) {
             AcademicYear::where('id', '!=', $item->id)->where('is_active', true)->update(['is_active' => false]);
         }

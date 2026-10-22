@@ -15,27 +15,21 @@ class LookupController extends Controller
     public function gradeLevels(): JsonResponse
     {
         return response()->json([
-            'data' => Cache::remember('grade_levels', 3600, function () {
-                return GradeLevel::orderBy('order')->orderBy('id')->get();
-            })
+            'data' => GradeLevel::orderBy('order')->orderBy('id')->get()
         ]);
     }
 
     public function subjects(): JsonResponse
     {
         return response()->json([
-            'data' => Cache::remember('subjects', 3600, function () {
-                return Subject::orderBy('name')->get();
-            })
+            'data' => Subject::orderBy('name')->get()
         ]);
     }
 
     public function academicYears(): JsonResponse
     {
         return response()->json([
-            'data' => Cache::remember('academic_years', 3600, function () {
-                return AcademicYear::orderByDesc('id')->get();
-            })
+            'data' => AcademicYear::orderByDesc('id')->get()
         ]);
     }
     public function terms(Request $request)
