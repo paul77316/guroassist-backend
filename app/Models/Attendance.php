@@ -11,10 +11,10 @@ class Attendance extends Model
 
     protected $fillable = [
         'student_id', 'class_assignment_id', 'attendance_date',
-        'status', 'remarks', 'recorded_by',
+        'status', 'remarks', 'recorded_by', 'sync_version',
     ];
 
-    protected $casts = ['attendance_date' => 'date:Y-m-d'];
+    protected $casts = ['attendance_date' => 'date:Y-m-d', 'sync_version' => 'integer'];
 
     public function student(): BelongsTo
     {

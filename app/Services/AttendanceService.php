@@ -35,6 +35,7 @@ class AttendanceService
             'full_name' => $s->full_name,
             'status' => $marked[$s->id]->status ?? null,
             'remarks' => $marked[$s->id]->remarks ?? null,
+            'version' => $marked[$s->id]->sync_version ?? 0,
         ])->values();
     }
 
@@ -75,6 +76,12 @@ class AttendanceService
                     ['student_id', 'class_assignment_id', 'attendance_date'],
                     ['status', 'remarks', 'recorded_by', 'updated_at']
                 );
+
+                // Every write moves the version, so an offline device holding an older one gets a conflict.
+                Attendance::where('class_assignment_id', $ca->id)
+                    ->whereDate('attendance_date', $date)
+                    ->whereIn('student_id', array_column($rows, 'student_id'))
+                    ->increment('sync_version');
             }
 
             if ($clearIds) {
