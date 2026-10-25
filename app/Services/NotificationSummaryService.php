@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\AttendanceSyncOperation;
+use App\Models\ClassAssignment;
 use App\Models\NotificationPreference;
 use App\Models\User;
 use Carbon\Carbon;
@@ -78,12 +79,40 @@ class NotificationSummaryService
         $nextDayStartsAt = $dayStartsAt->copy()->addDay();
         $due = $this->today->followUpsDue($user, $today);
         $review = $prefs['include_students_to_review'] ? $this->today->studentsToReview($user) : null;
-        $mobileAttendanceSynced = AttendanceSyncOperation::query()
+        $syncedMarks = AttendanceSyncOperation::query()
             ->where('user_id', $user->id)
             ->where('outcome', 'applied')
             ->where('updated_at', '>=', $dayStartsAt)
             ->where('updated_at', '<', $nextDayStartsAt)
-            ->count();
+            ->select('class_assignment_id', 'student_id', 'attendance_date')
+            ->groupBy('class_assignment_id', 'student_id', 'attendance_date');
+        $mobileAttendanceSynced = DB::query()->fromSub($syncedMarks, 'synced_marks')->count();
+        $mobileAttendanceSyncs = AttendanceSyncOperation::query()
+            ->where('user_id', $user->id)
+            ->where('outcome', 'applied')
+            ->where('updated_at', '>=', $dayStartsAt)
+            ->where('updated_at', '<', $nextDayStartsAt)
+            ->selectRaw('class_assignment_id, attendance_date, COUNT(DISTINCT student_id) as marks_count')
+            ->groupBy('class_assignment_id', 'attendance_date')
+            ->orderBy('attendance_date')
+            ->get();
+        $classes = ClassAssignment::query()
+            ->with(['section.gradeLevel', 'subject'])
+            ->whereIn('id', $mobileAttendanceSyncs->pluck('class_assignment_id')->unique())
+            ->get()
+            ->keyBy('id');
+        $mobileAttendanceSyncs = $mobileAttendanceSyncs->map(function ($sync) use ($classes) {
+            $class = $classes->get($sync->class_assignment_id);
+            $classLabel = $class
+                ? ($class->section?->gradeLevel?->name ?? '').' - '.($class->section?->name ?? '').' ('.($class->subject?->name ?? '').')'
+                : 'Class';
+
+            return [
+                'class' => $classLabel,
+                'attendance_date' => Carbon::parse($sync->attendance_date)->toDateString(),
+                'marks_count' => (int) $sync->marks_count,
+            ];
+        })->values();
 
         return [
             'enabled' => true,
@@ -91,6 +120,7 @@ class NotificationSummaryService
             'follow_ups_due' => $due,
             'students_to_review' => $review,
             'mobile_attendance_synced' => $mobileAttendanceSynced,
+            'mobile_attendance_syncs' => $mobileAttendanceSyncs,
             'badge_count' => $due['total'] + ($review ?? 0) + $mobileAttendanceSynced,
         ];
     }

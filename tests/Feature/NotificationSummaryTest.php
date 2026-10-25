@@ -202,15 +202,23 @@ class NotificationSummaryTest extends TestCase
         DB::table('attendance_sync_operations')
             ->where('id', $oldReceipt->id)
             ->update(['updated_at' => '2030-03-09 15:59:59']); // One second before the Manila day starts.
+        $anotherStudent = $this->student($this->class);
+        $this->syncReceipt($this->owner, 'applied', $anotherStudent, '2030-03-09');
 
         Sanctum::actingAs($this->owner);
         $this->getJson('/api/notifications/summary')->assertOk()
             ->assertJsonPath('data.mobile_attendance_synced', 2)
+            ->assertJsonPath('data.mobile_attendance_syncs.0.class', 'Grade 8 - Mabini (Mathematics)')
+            ->assertJsonPath('data.mobile_attendance_syncs.0.attendance_date', '2030-03-09')
+            ->assertJsonPath('data.mobile_attendance_syncs.0.marks_count', 1)
+            ->assertJsonPath('data.mobile_attendance_syncs.1.attendance_date', '2030-03-10')
+            ->assertJsonPath('data.mobile_attendance_syncs.1.marks_count', 1)
             ->assertJsonPath('data.badge_count', 2);
 
         Sanctum::actingAs($this->other);
         $this->getJson('/api/notifications/summary')->assertOk()
             ->assertJsonPath('data.mobile_attendance_synced', 1)
+            ->assertJsonPath('data.mobile_attendance_syncs.0.marks_count', 1)
             ->assertJsonPath('data.badge_count', 1);
     }
 
@@ -254,7 +262,7 @@ class NotificationSummaryTest extends TestCase
         $this->assertStringNotContainsString('SECRET', $res->getContent());
         $this->assertStringNotContainsString($this->student1->first_name, $res->getContent());
         $res->assertJsonStructure(['data' => [
-            'enabled', 'today', 'students_to_review', 'mobile_attendance_synced', 'badge_count',
+            'enabled', 'today', 'students_to_review', 'mobile_attendance_synced', 'mobile_attendance_syncs', 'badge_count',
             'follow_ups_due' => ['interventions', 'parent_contacts', 'total', 'overdue'],
         ]]);
     }
@@ -337,14 +345,14 @@ class NotificationSummaryTest extends TestCase
         ], $over));
     }
 
-    private function syncReceipt(User $user, string $outcome): AttendanceSyncOperation
+    private function syncReceipt(User $user, string $outcome, ?Student $student = null, string $date = '2030-03-10'): AttendanceSyncOperation
     {
         return AttendanceSyncOperation::create([
             'operation_id' => (string) Str::uuid(),
             'user_id' => $user->id,
             'class_assignment_id' => $this->class->id,
-            'student_id' => $this->student1->id,
-            'attendance_date' => '2030-03-10',
+            'student_id' => ($student ?? $this->student1)->id,
+            'attendance_date' => $date,
             'status' => 'present',
             'base_version' => 0,
             'payload_hash' => hash('sha256', Str::uuid()->toString()),
