@@ -3,8 +3,9 @@
 use App\Http\Controllers\Api\AcademicYearController;
 use App\Http\Controllers\Api\AssignmentController;
 use App\Http\Controllers\Api\AttendanceController;
-use App\Http\Controllers\Api\AttendanceSummaryController;
+use App\Http\Controllers\Api\AttendanceCorrectionController;
 use App\Http\Controllers\Api\AttendanceSyncController;
+use App\Http\Controllers\Api\AttendanceSummaryController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClassAssignmentController;
 use App\Http\Controllers\Api\ClassStudentController;
@@ -19,6 +20,8 @@ use App\Http\Controllers\Api\GradeLevelController;
 use App\Http\Controllers\Api\InterventionController;
 use App\Http\Controllers\Api\InterventionListController;
 use App\Http\Controllers\Api\LookupController;
+use App\Http\Controllers\Api\MobileAuthController;
+use App\Http\Controllers\Api\MobileDeviceAdminController;
 use App\Http\Controllers\Api\MonitoringSettingController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\ParentCommunicationController;
@@ -31,12 +34,26 @@ use App\Http\Controllers\Api\StudentsToReviewController;
 use App\Http\Controllers\Api\SubjectController;
 use App\Http\Controllers\Api\TeacherAccountController;
 use App\Http\Controllers\Api\TermController;
+use App\Http\Middleware\RejectMobileTokens;
+use App\Http\Middleware\RequireApprovedMobileDevice;
 use App\Http\Middleware\RequireInitialPasswordUpdate;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/auth/login', [AuthController::class, 'login']);
+Route::post('/mobile/login', [MobileAuthController::class, 'login'])->middleware('throttle:10,1');
 
-Route::middleware('auth:sanctum')->group(function () {
+// Mobile app only: a real device token from an admin-approved device. Web sessions are refused here.
+Route::middleware(['auth:sanctum', RequireApprovedMobileDevice::class])->prefix('mobile')->group(function () {
+    Route::post('/logout', [MobileAuthController::class, 'logout']);
+    Route::get('/classes', [ClassAssignmentController::class, 'index']);
+    Route::get('/attendance', [AttendanceController::class, 'index']);
+    Route::get('/class-assignments/{class_assignment}/seating-layout', [SeatingChartController::class, 'show']);
+    Route::post('/attendance/sync', [AttendanceSyncController::class, 'store'])->middleware('throttle:120,1');
+    Route::post('/attendance/sync/{operation_id}/resolve', [AttendanceSyncController::class, 'resolve'])->middleware('throttle:60,1');
+    Route::get('/attendance/sync/readiness', [AttendanceSyncController::class, 'readiness'])->middleware('throttle:120,1');
+});
+
+Route::middleware(['auth:sanctum', RejectMobileTokens::class])->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/auth/me', [AuthController::class, 'me']);
     Route::put('/auth/initial-password', [AuthController::class, 'changeInitialPassword'])->middleware('throttle:5,1');
@@ -48,10 +65,6 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/subjects', [LookupController::class, 'subjects']);
         Route::get('/academic-years', [LookupController::class, 'academicYears']);
         Route::get('/attendance', [AttendanceController::class, 'index']);
-        Route::post('/attendance/bulk', [AttendanceController::class, 'bulkStore']);
-        Route::post('/attendance/sync', [AttendanceSyncController::class, 'store'])->middleware('throttle:120,1');
-        Route::post('/attendance/sync/{operation_id}/resolve', [AttendanceSyncController::class, 'resolve'])->middleware('throttle:60,1');
-        Route::get('/attendance/sync/readiness', [AttendanceSyncController::class, 'readiness'])->middleware('throttle:120,1');
         Route::get('class-assignments/{class_assignment}/seating-layout', [SeatingChartController::class, 'show']);
         Route::put('class-assignments/{class_assignment}/seating-layout', [SeatingChartController::class, 'update']);
         Route::get('/terms', [LookupController::class, 'terms']);
@@ -132,6 +145,10 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/exam-questions/{question}/image', [ExamQuestionImageController::class, 'show']);
         Route::delete('/exam-questions/{question}/image', [ExamQuestionImageController::class, 'destroy']);
         Route::prefix('admin')->group(function () {
+            Route::post('attendance/corrections', [AttendanceCorrectionController::class, 'store'])->middleware('throttle:60,1');
+            Route::get('mobile-devices', [MobileDeviceAdminController::class, 'index']);
+            Route::post('mobile-devices/{device}/approve', [MobileDeviceAdminController::class, 'approve']);
+            Route::post('mobile-devices/{device}/revoke', [MobileDeviceAdminController::class, 'revoke']);
             Route::get('teachers', [TeacherAccountController::class, 'index']);
             Route::post('teachers', [TeacherAccountController::class, 'store']);
             Route::put('teachers/{teacher}', [TeacherAccountController::class, 'update']);

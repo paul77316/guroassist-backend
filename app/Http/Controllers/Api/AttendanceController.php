@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Http\Requests\BulkStoreAttendanceRequest;
 use App\Http\Requests\ShowAttendanceRequest;
 use App\Models\ClassAssignment;
 use App\Services\AttendanceService;
@@ -23,20 +22,5 @@ class AttendanceController extends Controller
             'date' => $request->date,
             'students' => $this->service->rosterWithStatus($ca, $request->date),
         ]]);
-    }
-
-    public function bulkStore(BulkStoreAttendanceRequest $request): JsonResponse
-    {
-        $ca = ClassAssignment::findOrFail($request->class_assignment_id);
-        $this->authorize('recordAttendance', $ca);
-
-        $count = $this->service->saveBulk(
-            $ca,
-            $request->date,
-            $request->records,
-            $request->user()->id
-        );
-
-        return response()->json(['message' => 'Attendance saved.', 'saved' => $count]);
     }
 }

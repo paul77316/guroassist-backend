@@ -10,6 +10,7 @@ use App\Models\AuditLog;
 use App\Models\ClassAssignment;
 use App\Models\Enrollment;
 use App\Models\GradeLevel;
+use App\Models\MobileDevice;
 use App\Models\MonitoringSetting;
 use App\Models\Section;
 use App\Models\Student;
@@ -89,28 +90,47 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_guests_are_rejected_and_nothing_is_stored(): void
     {
-        $this->postJson('/api/attendance/sync', ['operations' => [$this->op()]])->assertUnauthorized();
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => [$this->op()]])->assertUnauthorized();
 
         $this->assertSame(0, Attendance::count());
         $this->assertSame(0, AttendanceSyncOperation::count());
     }
 
-    public function test_a_malformed_batch_is_rejected_whole(): void
+    public function test_a_web_session_cannot_use_the_mobile_sync_routes(): void
     {
         Sanctum::actingAs($this->owner);
 
-        $this->postJson('/api/attendance/sync', ['operations' => []])->assertUnprocessable();
-        $this->postJson('/api/attendance/sync', ['operations' => [$this->op(['status' => 'sleeping'])]])->assertUnprocessable();
-        $this->postJson('/api/attendance/sync', ['operations' => [$this->op(['operation_id' => 'nope'])]])->assertUnprocessable();
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => [$this->op()]])
+            ->assertForbidden()
+            ->assertJsonPath('code', 'mobile_token_required');
+
+        $this->assertSame(0, Attendance::count());
+    }
+
+    public function test_the_old_web_attendance_write_routes_are_gone(): void
+    {
+        Sanctum::actingAs($this->owner);
+
+        $this->postJson('/api/attendance/bulk', [])->assertNotFound();
+        $this->postJson('/api/attendance/sync', ['operations' => [$this->op()]])->assertNotFound();
+    }
+
+    public function test_a_malformed_batch_is_rejected_whole(): void
+    {
+        $this->actAs($this->owner);
+
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => []])->assertUnprocessable();
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => [$this->op(['status' => 'sleeping'])]])->assertUnprocessable();
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => [$this->op(['operation_id' => 'nope'])]])->assertUnprocessable();
 
         $id = (string) Str::uuid();
-        $this->postJson('/api/attendance/sync', ['operations' => [$this->op(['operation_id' => $id]), $this->op(['operation_id' => $id])]])
+        $this->postJson('/api/mobile/attendance/sync', ['operations' => [$this->op(['operation_id' => $id]), $this->op(['operation_id' => $id])]])
             ->assertUnprocessable();
     }
 
     public function test_another_teachers_class_is_rejected_per_operation(): void
     {
-        Sanctum::actingAs($this->other);
+        $this->actAs($this->other);
 
         $this->sync([$this->op()])->assertOk()
             ->assertJsonPath('data.0.outcome', 'rejected')
@@ -123,22 +143,15 @@ class AttendanceSyncApiTest extends TestCase
     public function test_losing_access_to_the_class_before_sync_is_rejected(): void
     {
         $this->class->update(['teacher_id' => $this->otherProfile->id]);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op()])->assertJsonPath('data.0.reason', 'forbidden');
         $this->assertSame(0, Attendance::count());
     }
 
-    public function test_admins_can_sync_for_any_class(): void
-    {
-        Sanctum::actingAs($this->admin);
-
-        $this->sync([$this->op()])->assertJsonPath('data.0.outcome', 'applied');
-    }
-
     public function test_an_archived_or_deleted_class_is_rejected(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->class->update(['status' => 'archived']);
         $this->sync([$this->op()])->assertJsonPath('data.0.reason', 'class_archived');
@@ -153,7 +166,7 @@ class AttendanceSyncApiTest extends TestCase
     public function test_a_student_no_longer_enrolled_is_rejected(): void
     {
         Enrollment::where('student_id', $this->student->id)->delete();
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op()])->assertJsonPath('data.0.reason', 'not_enrolled');
         $this->assertSame(0, Attendance::count());
@@ -161,7 +174,7 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_a_future_date_is_rejected(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op(['date' => '2030-03-11'])])->assertJsonPath('data.0.reason', 'future_date');
         $this->assertSame(0, Attendance::count());
@@ -171,7 +184,7 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_a_new_operation_is_committed_acknowledged_and_audited(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'late', 'remarks' => 'Bus delay']);
 
         $this->sync([$op])->assertOk()
@@ -191,7 +204,7 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_retry_after_a_timeout_replays_the_receipt_without_duplicating(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op();
 
         $this->sync([$op])->assertJsonPath('data.0.outcome', 'applied');
@@ -209,7 +222,7 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_the_same_operation_id_with_a_different_payload_is_rejected_and_changes_nothing(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent']);
         $this->sync([$op]);
 
@@ -222,18 +235,18 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_an_operation_id_cannot_be_replayed_by_another_user(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op();
         $this->sync([$op]);
 
-        Sanctum::actingAs($this->admin);
+        $this->actAs($this->other);
         $this->sync([$op])->assertJsonPath('data.0.reason', 'operation_id_reused');
     }
 
     public function test_a_partial_batch_returns_one_outcome_per_operation(): void
     {
         $stranger = $this->makeStudent(null);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $good = $this->op();
         $bad = $this->op(['student_id' => $stranger->id]);
@@ -251,7 +264,7 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_two_edits_of_one_student_in_one_batch_apply_in_order(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op(['status' => 'absent']), $this->op(['status' => 'late'])])
             ->assertJsonPath('data.0.outcome', 'applied')
@@ -267,7 +280,7 @@ class AttendanceSyncApiTest extends TestCase
     public function test_a_stale_version_is_a_conflict_and_never_overwrites_the_server(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op])->assertOk()
@@ -282,14 +295,14 @@ class AttendanceSyncApiTest extends TestCase
 
         // Retrying the same operation stays a conflict.
         $this->sync([$op])->assertJsonPath('data.0.outcome', 'conflict')->assertJsonPath('data.0.replayed', true);
-        $this->getJson('/api/attendance/sync/readiness')
+        $this->getJson('/api/mobile/attendance/sync/readiness')
             ->assertJsonPath('data.unresolved_conflicts', 1)
             ->assertJsonPath('data.server_ready', false);
     }
 
     public function test_a_record_deleted_on_the_server_is_a_conflict(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op(['base_version' => 2])])
             ->assertJsonPath('data.0.outcome', 'conflict')
@@ -301,7 +314,7 @@ class AttendanceSyncApiTest extends TestCase
     public function test_the_same_mark_already_on_the_server_converges_without_a_write(): void
     {
         $this->serverMark('absent', 4);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op(['status' => 'absent', 'base_version' => 1])])
             ->assertJsonPath('data.0.outcome', 'applied')
@@ -311,29 +324,14 @@ class AttendanceSyncApiTest extends TestCase
         $this->assertSame(0, AuditLog::where('event', 'attendance.sync_applied')->count());
     }
 
-    public function test_a_web_bulk_save_moves_the_version_so_an_older_device_conflicts(): void
-    {
-        Sanctum::actingAs($this->owner);
-        $this->sync([$this->op(['status' => 'absent'])])->assertJsonPath('data.0.version', 1);
-
-        $this->postJson('/api/attendance/bulk', [
-            'class_assignment_id' => $this->class->id, 'date' => self::DATE,
-            'records' => [['student_id' => $this->student->id, 'status' => 'excused']],
-        ])->assertOk();
-
-        $this->assertSame(2, Attendance::firstOrFail()->sync_version);
-        $this->sync([$this->op(['status' => 'late', 'base_version' => 1])])->assertJsonPath('data.0.outcome', 'conflict');
-        $this->assertSame('excused', Attendance::firstOrFail()->status);
-    }
-
     public function test_keep_local_applies_the_device_mark_and_clears_the_gate(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op]);
 
-        $this->postJson("/api/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'keep_local'])
+        $this->postJson("/api/mobile/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'keep_local'])
             ->assertOk()
             ->assertJsonPath('data.outcome', 'applied')
             ->assertJsonPath('data.version', 4);
@@ -342,33 +340,33 @@ class AttendanceSyncApiTest extends TestCase
         $this->assertSame('absent', $row->status);
         $this->assertSame(4, $row->sync_version);
         $this->assertSame(1, AuditLog::where('event', 'attendance.conflict_keep_local')->count());
-        $this->getJson('/api/attendance/sync/readiness')->assertJsonPath('data.server_ready', true);
+        $this->getJson('/api/mobile/attendance/sync/readiness')->assertJsonPath('data.server_ready', true);
     }
 
     public function test_use_server_keeps_the_server_mark_and_discards_the_device_mark(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op]);
 
-        $this->postJson("/api/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'use_server'])
+        $this->postJson("/api/mobile/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'use_server'])
             ->assertOk()
             ->assertJsonPath('data.outcome', 'discarded')
             ->assertJsonPath('data.server.status', 'excused');
 
         $this->assertSame('excused', Attendance::firstOrFail()->status);
         $this->assertSame(1, AuditLog::where('event', 'attendance.conflict_use_server')->count());
-        $this->getJson('/api/attendance/sync/readiness')->assertJsonPath('data.server_ready', true);
+        $this->getJson('/api/mobile/attendance/sync/readiness')->assertJsonPath('data.server_ready', true);
     }
 
     public function test_resolving_twice_is_safe_but_cannot_flip_the_decision(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op]);
-        $url = "/api/attendance/sync/{$op['operation_id']}/resolve";
+        $url = "/api/mobile/attendance/sync/{$op['operation_id']}/resolve";
 
         $this->postJson($url, ['resolution' => 'keep_local'])->assertOk();
         $this->postJson($url, ['resolution' => 'keep_local'])->assertOk()->assertJsonPath('data.version', 4);
@@ -380,28 +378,28 @@ class AttendanceSyncApiTest extends TestCase
     public function test_only_someone_with_class_access_can_resolve_a_conflict(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op]);
-        $url = "/api/attendance/sync/{$op['operation_id']}/resolve";
+        $url = "/api/mobile/attendance/sync/{$op['operation_id']}/resolve";
 
-        Sanctum::actingAs($this->other);
+        $this->actAs($this->other);
         $this->postJson($url, ['resolution' => 'keep_local'])->assertForbidden();
         $this->assertSame('excused', Attendance::firstOrFail()->status);
 
-        Sanctum::actingAs($this->admin);
+        $this->actAs($this->owner);
         $this->postJson($url, ['resolution' => 'keep_local'])->assertOk();
     }
 
     public function test_a_conflict_cannot_be_resolved_after_the_class_is_archived(): void
     {
         $this->serverMark('excused', 3);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent', 'base_version' => 1]);
         $this->sync([$op]);
         $this->class->update(['status' => 'archived']);
 
-        $this->postJson("/api/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'keep_local'])->assertUnprocessable();
+        $this->postJson("/api/mobile/attendance/sync/{$op['operation_id']}/resolve", ['resolution' => 'keep_local'])->assertUnprocessable();
         $this->assertSame('excused', Attendance::firstOrFail()->status);
     }
 
@@ -412,7 +410,7 @@ class AttendanceSyncApiTest extends TestCase
         Queue::fake();
         $this->student->update(['guardian_email' => 'parent@test.local']);
         MonitoringSetting::create(['teacher_id' => $this->ownerProfile->id, 'guardian_email_enabled' => true, 'notify_on_absent' => true]);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
         $op = $this->op(['status' => 'absent']);
 
         $this->sync([$op]);
@@ -421,13 +419,27 @@ class AttendanceSyncApiTest extends TestCase
         Queue::assertPushed(SendGuardianAttendanceNotice::class, 1);
     }
 
+    public function test_an_old_backfilled_absence_is_saved_without_a_guardian_notice(): void
+    {
+        Queue::fake();
+        $this->student->update(['guardian_email' => 'parent@test.local']);
+        MonitoringSetting::create(['teacher_id' => $this->ownerProfile->id, 'guardian_email_enabled' => true, 'notify_on_absent' => true]);
+        $this->actAs($this->owner);
+
+        $this->sync([$this->op(['status' => 'absent', 'date' => '2030-03-05'])])
+            ->assertJsonPath('data.0.outcome', 'applied');
+
+        $this->assertSame(1, Attendance::count());
+        Queue::assertNothingPushed();
+    }
+
     public function test_rejected_and_conflicting_operations_queue_no_guardian_notice(): void
     {
         Queue::fake();
         $this->student->update(['guardian_email' => 'parent@test.local']);
         MonitoringSetting::create(['teacher_id' => $this->ownerProfile->id, 'guardian_email_enabled' => true, 'notify_on_absent' => true]);
         $this->serverMark('present', 2);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
         $this->sync([$this->op(['status' => 'absent', 'base_version' => 1])]);
 
@@ -437,9 +449,9 @@ class AttendanceSyncApiTest extends TestCase
     public function test_attendance_roster_exposes_the_version_devices_must_send_back(): void
     {
         $this->serverMark('late', 5);
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
-        $this->getJson('/api/attendance?class_assignment_id='.$this->class->id.'&date='.self::DATE)
+        $this->getJson('/api/mobile/attendance?class_assignment_id='.$this->class->id.'&date='.self::DATE)
             ->assertOk()
             ->assertJsonFragment(['student_id' => $this->student->id, 'status' => 'late', 'version' => 5])
             ->assertJsonFragment(['student_id' => $this->student2->id, 'status' => null, 'version' => 0]);
@@ -447,9 +459,9 @@ class AttendanceSyncApiTest extends TestCase
 
     public function test_a_fresh_user_with_no_conflicts_is_server_ready(): void
     {
-        Sanctum::actingAs($this->owner);
+        $this->actAs($this->owner);
 
-        $this->getJson('/api/attendance/sync/readiness')
+        $this->getJson('/api/mobile/attendance/sync/readiness')
             ->assertOk()
             ->assertJsonPath('data.unresolved_conflicts', 0)
             ->assertJsonPath('data.server_ready', true);
@@ -457,9 +469,23 @@ class AttendanceSyncApiTest extends TestCase
 
     // ---------------------------------------------------------------- helpers
 
+    /** Signs in as an approved mobile device, the only way to reach the mobile routes. */
+    private function actAs(User $user): void
+    {
+        $this->app['auth']->forgetGuards();
+
+        $device = MobileDevice::create([
+            'user_id' => $user->id, 'device_uuid' => (string) Str::uuid(), 'name' => 'Test phone',
+            'status' => 'approved', 'approved_at' => now(),
+        ]);
+        $token = $user->createToken($device->tokenName(), [MobileDevice::ABILITY])->plainTextToken;
+
+        $this->withToken($token);
+    }
+
     private function sync(array $operations)
     {
-        return $this->postJson('/api/attendance/sync', ['operations' => $operations]);
+        return $this->postJson('/api/mobile/attendance/sync', ['operations' => $operations]);
     }
 
     /** @return array<string, mixed> */
