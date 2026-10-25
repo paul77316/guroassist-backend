@@ -222,6 +222,44 @@ class NotificationSummaryTest extends TestCase
             ->assertJsonPath('data.badge_count', 1);
     }
 
+    public function test_teacher_can_mark_a_class_and_date_sync_group_as_read_and_new_syncs_reappear(): void
+    {
+        $this->enable($this->owner);
+        $this->enable($this->other);
+        $this->syncReceipt($this->owner, 'applied');
+        $this->syncReceipt($this->other, 'applied');
+
+        Sanctum::actingAs($this->owner);
+        $this->postJson('/api/notifications/attendance-syncs/read', [
+            'class_assignment_id' => $this->class->id,
+            'attendance_date' => '2030-03-10',
+        ])->assertOk()->assertJsonPath('data.read', true);
+
+        $this->getJson('/api/notifications/summary')->assertOk()
+            ->assertJsonPath('data.mobile_attendance_synced', 0)
+            ->assertJsonPath('data.mobile_attendance_syncs', [])
+            ->assertJsonPath('data.badge_count', 0);
+
+        Sanctum::actingAs($this->other);
+        $this->getJson('/api/notifications/summary')->assertOk()
+            ->assertJsonPath('data.mobile_attendance_synced', 1);
+
+        Sanctum::actingAs($this->owner);
+        $this->syncReceipt($this->owner, 'applied');
+        $this->getJson('/api/notifications/summary')->assertOk()
+            ->assertJsonPath('data.mobile_attendance_synced', 1)
+            ->assertJsonPath('data.mobile_attendance_syncs.0.marks_count', 1);
+    }
+
+    public function test_admins_cannot_mark_teacher_attendance_syncs_as_read(): void
+    {
+        Sanctum::actingAs($this->admin);
+        $this->postJson('/api/notifications/attendance-syncs/read', [
+            'class_assignment_id' => $this->class->id,
+            'attendance_date' => '2030-03-10',
+        ])->assertForbidden();
+    }
+
     public function test_the_count_follows_the_record_and_the_class_rule(): void
     {
         $this->enable($this->owner);

@@ -4,8 +4,8 @@ use App\Http\Controllers\Api\AcademicYearController;
 use App\Http\Controllers\Api\AssignmentController;
 use App\Http\Controllers\Api\AttendanceController;
 use App\Http\Controllers\Api\AttendanceCorrectionController;
-use App\Http\Controllers\Api\AttendanceSyncController;
 use App\Http\Controllers\Api\AttendanceSummaryController;
+use App\Http\Controllers\Api\AttendanceSyncController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClassAssignmentController;
 use App\Http\Controllers\Api\ClassStudentController;
@@ -118,6 +118,7 @@ Route::middleware(['auth:sanctum', RejectMobileTokens::class])->group(function (
         Route::get('/monitoring/active-interventions', [StudentsToReviewController::class, 'activeInterventions']);
         Route::get('/interventions', [InterventionListController::class, 'index']);
         Route::get('/notifications/summary', [NotificationController::class, 'summary'])->middleware('throttle:90,1');
+        Route::post('/notifications/attendance-syncs/read', [NotificationController::class, 'markAttendanceSyncRead'])->middleware('throttle:60,1');
         Route::get('/notifications/preferences', [NotificationController::class, 'showPreferences']);
         Route::put('/notifications/preferences', [NotificationController::class, 'updatePreferences']);
         Route::get('/dashboard/today', [DashboardController::class, 'today'])->middleware('throttle:90,1');

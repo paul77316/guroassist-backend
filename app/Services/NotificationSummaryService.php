@@ -7,11 +7,12 @@ use App\Models\ClassAssignment;
 use App\Models\NotificationPreference;
 use App\Models\User;
 use Carbon\Carbon;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Facades\DB;
 
 /**
- * In-app reminders: counts only, calculated on request, never stored.
- * No names, no text, neutral wording. Off until the teacher opts in; admins have no reminders.
+ * In-app reminders: summaries are calculated on request; attendance read cursors are stored per teacher and class/date.
+ * No student names or notes. Off until the teacher opts in; admins have no reminders.
  * The counting itself lives in TodaySummaryService (single source of truth, shared with the dashboard panel),
  * so every visibility rule applies exactly as there.
  */
@@ -62,6 +63,38 @@ class NotificationSummaryService
         });
     }
 
+    public function markAttendanceSyncGroupRead(User $user, int $classId, string $attendanceDate): bool
+    {
+        $today = $this->guard->today();
+        $timezone = config('monitoring.timezone');
+        $dayStartsAt = Carbon::parse($today, $timezone)->startOfDay()->utc();
+        $nextDayStartsAt = $dayStartsAt->copy()->addDay();
+
+        return DB::transaction(function () use ($user, $classId, $attendanceDate, $dayStartsAt, $nextDayStartsAt) {
+            User::query()->whereKey($user->id)->lockForUpdate()->first();
+            $latestOperationId = AttendanceSyncOperation::query()
+                ->where('user_id', $user->id)
+                ->where('class_assignment_id', $classId)
+                ->whereDate('attendance_date', $attendanceDate)
+                ->where('outcome', 'applied')
+                ->where('updated_at', '>=', $dayStartsAt)
+                ->where('updated_at', '<', $nextDayStartsAt)
+                ->max('id');
+
+            if ($latestOperationId === null) {
+                return false;
+            }
+
+            $now = now();
+            DB::table('teacher_notification_sync_reads')->updateOrInsert(
+                ['user_id' => $user->id, 'class_assignment_id' => $classId, 'attendance_date' => $attendanceDate],
+                ['last_operation_id' => $latestOperationId, 'updated_at' => $now, 'created_at' => $now],
+            );
+
+            return true;
+        });
+    }
+
     /**
      * What the bell shows. When the switch is off (or for an admin) this is only ['enabled' => false]
      * and nothing else is queried.
@@ -79,25 +112,29 @@ class NotificationSummaryService
         $nextDayStartsAt = $dayStartsAt->copy()->addDay();
         $due = $this->today->followUpsDue($user, $today);
         $review = $prefs['include_students_to_review'] ? $this->today->studentsToReview($user) : null;
-        $syncedMarks = AttendanceSyncOperation::query()
-            ->where('user_id', $user->id)
-            ->where('outcome', 'applied')
-            ->where('updated_at', '>=', $dayStartsAt)
-            ->where('updated_at', '<', $nextDayStartsAt)
-            ->select('class_assignment_id', 'student_id', 'attendance_date')
-            ->groupBy('class_assignment_id', 'student_id', 'attendance_date');
+        $unreadOperations = AttendanceSyncOperation::query()
+            ->leftJoin('teacher_notification_sync_reads as sync_reads', function (JoinClause $join) use ($user) {
+                $join->on('attendance_sync_operations.class_assignment_id', '=', 'sync_reads.class_assignment_id')
+                    ->on('attendance_sync_operations.attendance_date', '=', 'sync_reads.attendance_date')
+                    ->where('sync_reads.user_id', '=', $user->id);
+            })
+            ->where('attendance_sync_operations.user_id', $user->id)
+            ->where('attendance_sync_operations.outcome', 'applied')
+            ->where('attendance_sync_operations.updated_at', '>=', $dayStartsAt)
+            ->where('attendance_sync_operations.updated_at', '<', $nextDayStartsAt)
+            ->whereRaw('attendance_sync_operations.id > COALESCE(sync_reads.last_operation_id, 0)');
+        $syncedMarks = (clone $unreadOperations)
+            ->select('attendance_sync_operations.class_assignment_id', 'attendance_sync_operations.student_id', 'attendance_sync_operations.attendance_date')
+            ->groupBy('attendance_sync_operations.class_assignment_id', 'attendance_sync_operations.student_id', 'attendance_sync_operations.attendance_date');
         $mobileAttendanceSynced = DB::query()->fromSub($syncedMarks, 'synced_marks')->count();
-        $mobileAttendanceSyncs = AttendanceSyncOperation::query()
-            ->where('user_id', $user->id)
-            ->where('outcome', 'applied')
-            ->where('updated_at', '>=', $dayStartsAt)
-            ->where('updated_at', '<', $nextDayStartsAt)
-            ->selectRaw('class_assignment_id, attendance_date, COUNT(DISTINCT student_id) as marks_count')
-            ->groupBy('class_assignment_id', 'attendance_date')
-            ->orderBy('attendance_date')
+        $mobileAttendanceSyncs = (clone $unreadOperations)
+            ->selectRaw('attendance_sync_operations.class_assignment_id, attendance_sync_operations.attendance_date, COUNT(DISTINCT attendance_sync_operations.student_id) as marks_count')
+            ->groupBy('attendance_sync_operations.class_assignment_id', 'attendance_sync_operations.attendance_date')
+            ->orderBy('attendance_sync_operations.attendance_date')
             ->get();
         $classes = ClassAssignment::query()
             ->with(['section.gradeLevel', 'subject'])
+            ->withTrashed()
             ->whereIn('id', $mobileAttendanceSyncs->pluck('class_assignment_id')->unique())
             ->get()
             ->keyBy('id');
@@ -108,6 +145,7 @@ class NotificationSummaryService
                 : 'Class';
 
             return [
+                'class_assignment_id' => (int) $sync->class_assignment_id,
                 'class' => $classLabel,
                 'attendance_date' => Carbon::parse($sync->attendance_date)->toDateString(),
                 'marks_count' => (int) $sync->marks_count,
