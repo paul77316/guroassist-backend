@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\AttendanceSyncOperation;
 use App\Models\NotificationPreference;
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
@@ -73,13 +74,19 @@ class NotificationSummaryService
         $today = $this->guard->today();
         $due = $this->today->followUpsDue($user, $today);
         $review = $prefs['include_students_to_review'] ? $this->today->studentsToReview($user) : null;
+        $mobileAttendanceSynced = AttendanceSyncOperation::query()
+            ->where('user_id', $user->id)
+            ->where('outcome', 'applied')
+            ->whereDate('updated_at', $today)
+            ->count();
 
         return [
             'enabled' => true,
             'today' => $today,
             'follow_ups_due' => $due,
             'students_to_review' => $review,
-            'badge_count' => $due['total'] + ($review ?? 0),
+            'mobile_attendance_synced' => $mobileAttendanceSynced,
+            'badge_count' => $due['total'] + ($review ?? 0) + $mobileAttendanceSynced,
         ];
     }
 

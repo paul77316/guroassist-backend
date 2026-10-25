@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\AcademicYear;
+use App\Models\AttendanceSyncOperation;
 use App\Models\AuditLog;
 use App\Models\ClassAssignment;
 use App\Models\Enrollment;
@@ -20,6 +21,7 @@ use App\Services\ParentCommunicationService;
 use Carbon\Carbon;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Laravel\Sanctum\Sanctum;
 use RuntimeException;
 use Tests\TestCase;
@@ -35,15 +37,20 @@ class NotificationSummaryTest extends TestCase
     private const TZ = 'Asia/Manila';
 
     private User $owner;
+
     private User $other;
+
     private User $admin;
+
     private ClassAssignment $class;
+
     private Student $student1;
+
     private int $seq = 0;
 
     protected function beforeRefreshingDatabase(): void
     {
-        $db = (string) config('database.connections.' . config('database.default') . '.database');
+        $db = (string) config('database.connections.'.config('database.default').'.database');
         if (! str_ends_with($db, '_test')) {
             throw new RuntimeException("Refusing to wipe '$db'. Point phpunit.xml at a database whose name ends in _test.");
         }
@@ -168,13 +175,39 @@ class NotificationSummaryTest extends TestCase
             ->assertJsonPath('data.follow_ups_due.total', 4)
             ->assertJsonPath('data.follow_ups_due.overdue', 2)
             ->assertJsonPath('data.students_to_review', null)
+            ->assertJsonPath('data.mobile_attendance_synced', 0)
             ->assertJsonPath('data.badge_count', 4);
 
         // Someone else's records are not counted, even though they teach the same student.
         Sanctum::actingAs($this->other);
         $this->getJson('/api/notifications/summary')->assertOk()
             ->assertJsonPath('data.follow_ups_due.total', 0)
+            ->assertJsonPath('data.mobile_attendance_synced', 0)
             ->assertJsonPath('data.badge_count', 0);
+    }
+
+    public function test_mobile_sync_badge_counts_only_successful_marks_for_the_teacher_who_synced_them_today(): void
+    {
+        $this->enable($this->owner);
+        $this->enable($this->other);
+
+        $this->syncReceipt($this->owner, 'applied');
+        $this->syncReceipt($this->owner, 'conflict');
+        $this->syncReceipt($this->other, 'applied');
+        $oldReceipt = $this->syncReceipt($this->owner, 'applied');
+        DB::table('attendance_sync_operations')
+            ->where('id', $oldReceipt->id)
+            ->update(['updated_at' => Carbon::parse('2030-03-09 10:00:00', self::TZ)]);
+
+        Sanctum::actingAs($this->owner);
+        $this->getJson('/api/notifications/summary')->assertOk()
+            ->assertJsonPath('data.mobile_attendance_synced', 1)
+            ->assertJsonPath('data.badge_count', 1);
+
+        Sanctum::actingAs($this->other);
+        $this->getJson('/api/notifications/summary')->assertOk()
+            ->assertJsonPath('data.mobile_attendance_synced', 1)
+            ->assertJsonPath('data.badge_count', 1);
     }
 
     public function test_the_count_follows_the_record_and_the_class_rule(): void
@@ -217,7 +250,7 @@ class NotificationSummaryTest extends TestCase
         $this->assertStringNotContainsString('SECRET', $res->getContent());
         $this->assertStringNotContainsString($this->student1->first_name, $res->getContent());
         $res->assertJsonStructure(['data' => [
-            'enabled', 'today', 'students_to_review', 'badge_count',
+            'enabled', 'today', 'students_to_review', 'mobile_attendance_synced', 'badge_count',
             'follow_ups_due' => ['interventions', 'parent_contacts', 'total', 'overdue'],
         ]]);
     }
@@ -269,7 +302,7 @@ class NotificationSummaryTest extends TestCase
     private function student(?ClassAssignment $class): Student
     {
         $student = Student::create([
-            'student_id' => 'N-' . (++$this->seq), 'first_name' => 'Student' . $this->seq, 'last_name' => 'Test',
+            'student_id' => 'N-'.(++$this->seq), 'first_name' => 'Student'.$this->seq, 'last_name' => 'Test',
             'sex' => 'male', 'date_of_birth' => '2015-01-01', 'status' => 'active',
         ]);
 
@@ -298,5 +331,21 @@ class NotificationSummaryTest extends TestCase
             'intervention_type' => 'consultation', 'intervention_date' => '2030-03-01',
             'follow_up_date' => '2030-03-05', 'notes' => null,
         ], $over));
+    }
+
+    private function syncReceipt(User $user, string $outcome): AttendanceSyncOperation
+    {
+        return AttendanceSyncOperation::create([
+            'operation_id' => (string) Str::uuid(),
+            'user_id' => $user->id,
+            'class_assignment_id' => $this->class->id,
+            'student_id' => $this->student1->id,
+            'attendance_date' => '2030-03-10',
+            'status' => 'present',
+            'base_version' => 0,
+            'payload_hash' => hash('sha256', Str::uuid()->toString()),
+            'outcome' => $outcome,
+            'server_version' => 1,
+        ]);
     }
 }
