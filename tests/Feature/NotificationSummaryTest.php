@@ -194,15 +194,19 @@ class NotificationSummaryTest extends TestCase
         $this->syncReceipt($this->owner, 'applied');
         $this->syncReceipt($this->owner, 'conflict');
         $this->syncReceipt($this->other, 'applied');
+        $boundaryReceipt = $this->syncReceipt($this->owner, 'applied');
+        DB::table('attendance_sync_operations')
+            ->where('id', $boundaryReceipt->id)
+            ->update(['updated_at' => '2030-03-09 16:00:00']); // Midnight at the start of March 10 in Manila.
         $oldReceipt = $this->syncReceipt($this->owner, 'applied');
         DB::table('attendance_sync_operations')
             ->where('id', $oldReceipt->id)
-            ->update(['updated_at' => Carbon::parse('2030-03-09 10:00:00', self::TZ)]);
+            ->update(['updated_at' => '2030-03-09 15:59:59']); // One second before the Manila day starts.
 
         Sanctum::actingAs($this->owner);
         $this->getJson('/api/notifications/summary')->assertOk()
-            ->assertJsonPath('data.mobile_attendance_synced', 1)
-            ->assertJsonPath('data.badge_count', 1);
+            ->assertJsonPath('data.mobile_attendance_synced', 2)
+            ->assertJsonPath('data.badge_count', 2);
 
         Sanctum::actingAs($this->other);
         $this->getJson('/api/notifications/summary')->assertOk()

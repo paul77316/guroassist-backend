@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\AttendanceSyncOperation;
 use App\Models\NotificationPreference;
 use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -72,12 +73,16 @@ class NotificationSummaryService
         }
 
         $today = $this->guard->today();
+        $timezone = config('monitoring.timezone');
+        $dayStartsAt = Carbon::parse($today, $timezone)->startOfDay()->utc();
+        $nextDayStartsAt = $dayStartsAt->copy()->addDay();
         $due = $this->today->followUpsDue($user, $today);
         $review = $prefs['include_students_to_review'] ? $this->today->studentsToReview($user) : null;
         $mobileAttendanceSynced = AttendanceSyncOperation::query()
             ->where('user_id', $user->id)
             ->where('outcome', 'applied')
-            ->whereDate('updated_at', $today)
+            ->where('updated_at', '>=', $dayStartsAt)
+            ->where('updated_at', '<', $nextDayStartsAt)
             ->count();
 
         return [
