@@ -50,7 +50,7 @@ class MobileAuthController extends Controller
 
         if ($device->status === 'revoked') {
             return response()->json([
-                'message' => 'This device was removed. Ask an administrator.',
+                'message' => 'This device was removed. Ask an administrator to approve it again.',
                 'code' => 'device_revoked',
             ], 403);
         }

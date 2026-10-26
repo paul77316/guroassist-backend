@@ -32,18 +32,20 @@ class MobileDeviceAdminController extends Controller
     {
         abort_unless($request->user()?->isAdmin(), 403);
 
-        if ($device->status === 'revoked') {
-            throw ValidationException::withMessages(['device' => ['A removed device cannot be approved again. The teacher must register it as a new device.']]);
-        }
-
-        if ($device->status === 'pending') {
+        if (in_array($device->status, ['pending', 'revoked'], true)) {
             $approved = MobileDevice::where('user_id', $device->user_id)->where('status', 'approved')->count();
             if ($approved >= MobileDevice::MAX_APPROVED_PER_USER) {
                 throw ValidationException::withMessages(['device' => ['This teacher already has '.MobileDevice::MAX_APPROVED_PER_USER.' approved devices. Remove one first.']]);
             }
 
-            $device->update(['status' => 'approved', 'approved_by' => $request->user()->id, 'approved_at' => now()]);
-            AuditLogger::log($request->user(), $device, 'mobile_device.approved', ['status' => 'pending'], ['status' => 'approved']);
+            $oldStatus = $device->status;
+            $device->update([
+                'status' => 'approved',
+                'approved_by' => $request->user()->id,
+                'approved_at' => now(),
+                'revoked_at' => null,
+            ]);
+            AuditLogger::log($request->user(), $device, 'mobile_device.approved', ['status' => $oldStatus], ['status' => 'approved']);
         }
 
         return response()->json(['data' => $this->present($device->load('user:id,name,email'))]);

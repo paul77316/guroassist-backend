@@ -221,14 +221,17 @@ class MobileDeviceApiTest extends TestCase
         $this->device($this->teacher, 'approved');
         $this->device($this->teacher, 'approved');
         $third = $this->device($this->teacher, 'pending');
+        $removed = $this->device($this->teacher, 'revoked');
 
         $this->asAdmin();
         $this->postJson("/api/admin/mobile-devices/{$third->id}/approve")->assertUnprocessable();
+        $this->postJson("/api/admin/mobile-devices/{$removed->id}/approve")->assertUnprocessable();
 
         $this->assertSame('pending', $third->fresh()->status);
+        $this->assertSame('revoked', $removed->fresh()->status);
     }
 
-    public function test_revoking_a_device_kills_its_token_and_blocks_new_logins(): void
+    public function test_an_admin_can_reapprove_a_removed_device_and_teacher_can_sign_in_again(): void
     {
         $device = $this->device($this->teacher, 'approved');
         $token = $this->tokenFor($device);
@@ -241,9 +244,14 @@ class MobileDeviceApiTest extends TestCase
         $this->asDevice($token)->getJson('/api/mobile/attendance/sync/readiness')->assertUnauthorized();
         $this->flushHeaders();
         $this->login($this->teacher, $device->device_uuid)->assertForbidden()->assertJsonPath('code', 'device_revoked');
+        $this->assertSame('revoked', $device->fresh()->status);
 
         $this->asAdmin();
-        $this->postJson("/api/admin/mobile-devices/{$device->id}/approve")->assertUnprocessable();
+        $this->getJson('/api/admin/mobile-devices?status=revoked')->assertOk()->assertJsonCount(1, 'data');
+        $this->postJson("/api/admin/mobile-devices/{$device->id}/approve")->assertOk()->assertJsonPath('data.status', 'approved');
+        $this->assertNull($device->fresh()->revoked_at);
+        $this->flushHeaders();
+        $this->login($this->teacher, $device->device_uuid)->assertOk()->assertJsonStructure(['token', 'expires_at']);
     }
 
     // ---------------------------------------------------------------- helpers
