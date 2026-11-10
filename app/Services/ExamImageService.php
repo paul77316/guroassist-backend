@@ -21,9 +21,12 @@ use Throwable;
 class ExamImageService
 {
     public const MAX_WIDTH = 1600;
+
     public const MAX_PIXELS = 16000000;
 
     private const DISK = 'local';
+
+    public function __construct(private ExamStructureLock $structureLock) {}
 
     public function store(User $user, ExamQuestion $question, UploadedFile $file, ?string $alt): ExamQuestion
     {
@@ -35,7 +38,7 @@ class ExamImageService
         [$bytes, $ext] = $this->clean($file);
 
         $disk = Storage::disk(self::DISK);
-        $path = "exam-images/{$exam->id}/q{$question->id}-" . Str::random(16) . ".{$ext}";
+        $path = "exam-images/{$exam->id}/q{$question->id}-".Str::random(16).".{$ext}";
         $old = $question->image_path;
         $alt = $alt !== null && trim($alt) !== '' ? trim($alt) : null;
 
@@ -44,15 +47,19 @@ class ExamImageService
         }
 
         try {
-            DB::transaction(function () use ($user, $question, $exam, $path, $alt) {
-                $question->image_path = $path;
-                $question->image_alt = $alt;
-                $question->save();
+            $updated = DB::transaction(function () use ($user, $question, $exam, $path, $alt): ExamQuestion {
+                $this->structureLock->lockForStructuralEdit($exam);
+                $lockedQuestion = ExamQuestion::query()->lockForUpdate()->findOrFail($question->id);
+                $lockedQuestion->image_path = $path;
+                $lockedQuestion->image_alt = $alt;
+                $lockedQuestion->save();
 
                 AuditLogger::log($user, $exam, 'image_set', null, [
-                    'question_id' => $question->id,
+                    'question_id' => $lockedQuestion->id,
                     'has_alt' => $alt !== null,
                 ]);
+
+                return $lockedQuestion;
             });
         } catch (Throwable $e) {
             $disk->delete($path); // do not leave an orphan file behind
@@ -63,7 +70,7 @@ class ExamImageService
             $disk->delete($old);
         }
 
-        return $question;
+        return $updated;
     }
 
     public function remove(User $user, ExamQuestion $question): void
@@ -75,11 +82,13 @@ class ExamImageService
         }
 
         DB::transaction(function () use ($user, $question, $exam) {
-            $question->image_path = null;
-            $question->image_alt = null;
-            $question->save();
+            $this->structureLock->lockForStructuralEdit($exam);
+            $lockedQuestion = ExamQuestion::query()->lockForUpdate()->findOrFail($question->id);
+            $lockedQuestion->image_path = null;
+            $lockedQuestion->image_alt = null;
+            $lockedQuestion->save();
 
-            AuditLogger::log($user, $exam, 'image_removed', null, ['question_id' => $question->id]);
+            AuditLogger::log($user, $exam, 'image_removed', null, ['question_id' => $lockedQuestion->id]);
         });
 
         Storage::disk(self::DISK)->delete($path);

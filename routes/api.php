@@ -22,6 +22,7 @@ use App\Http\Controllers\Api\InterventionListController;
 use App\Http\Controllers\Api\LookupController;
 use App\Http\Controllers\Api\MobileAuthController;
 use App\Http\Controllers\Api\MobileDeviceAdminController;
+use App\Http\Controllers\Api\MobileExamScanController;
 use App\Http\Controllers\Api\MonitoringSettingController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\ParentCommunicationController;
@@ -51,6 +52,10 @@ Route::middleware(['auth:sanctum', RequireApprovedMobileDevice::class])->prefix(
     Route::post('/attendance/sync', [AttendanceSyncController::class, 'store'])->middleware('throttle:120,1');
     Route::post('/attendance/sync/{operation_id}/resolve', [AttendanceSyncController::class, 'resolve'])->middleware('throttle:60,1');
     Route::get('/attendance/sync/readiness', [AttendanceSyncController::class, 'readiness'])->middleware('throttle:120,1');
+    Route::get('/exam-scan/sets/{qr_token}', [MobileExamScanController::class, 'showSet']);
+    Route::get('/exam-scan/sets/{qr_token}/batches', [MobileExamScanController::class, 'index']);
+    Route::post('/exam-scan/batches', [MobileExamScanController::class, 'store'])->middleware('throttle:30,1');
+    Route::delete('/exam-scan/batches/{batch}', [MobileExamScanController::class, 'destroy'])->middleware('throttle:30,1');
 });
 
 Route::middleware(['auth:sanctum', RejectMobileTokens::class])->group(function () {

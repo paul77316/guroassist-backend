@@ -21,7 +21,10 @@ use Illuminate\Validation\ValidationException;
 class ExamService
 {
     public const CHOICE_COUNTS = [3, 4, 5];
+
     public const MAX_SETS = 10;
+
+    public function __construct(private ExamStructureLock $structureLock) {}
 
     // ---------------------------------------------------------------- create / edit
 
@@ -49,24 +52,27 @@ class ExamService
     {
         $payload = Arr::only($data, ['title', 'exam_date', 'choice_count']);
 
-        if (isset($payload['choice_count'])
-            && (int) $payload['choice_count'] !== (int) $exam->choice_count
-            && $exam->questions()->exists()) {
-            throw ValidationException::withMessages([
-                'choice_count' => ['The number of choices cannot change once the exam has questions.'],
-            ]);
-        }
-
         $flags = ['title_changed' => array_key_exists('title', $payload) && $payload['title'] !== $exam->title];
         $old = $this->values($exam);
 
         return DB::transaction(function () use ($user, $exam, $payload, $old, $flags) {
-            $exam->update($payload);
+            $locked = $this->structureLock->lock($exam);
+            if (isset($payload['choice_count'])
+                && (int) $payload['choice_count'] !== (int) $locked->choice_count) {
+                if ($locked->questions()->exists()) {
+                    throw ValidationException::withMessages([
+                        'choice_count' => ['The number of choices cannot change once the exam has questions.'],
+                    ]);
+                }
+                $this->structureLock->assertUnlocked($locked);
+            }
 
-            $event = $user->id === $exam->author_id ? 'updated' : 'admin_corrected';
-            AuditLogger::log($user, $exam, $event, $old, $this->values($exam->refresh()) + $flags);
+            $locked->update($payload);
 
-            return $exam;
+            $event = $user->id === $locked->author_id ? 'updated' : 'admin_corrected';
+            AuditLogger::log($user, $locked, $event, $old, $this->values($locked->refresh()) + $flags);
+
+            return $locked;
         });
     }
 
@@ -91,12 +97,12 @@ class ExamService
     public function addSet(User $user, Exam $exam): ExamSet
     {
         return DB::transaction(function () use ($user, $exam) {
-            // Lock the exam row so two requests cannot pick the same label.
-            Exam::query()->lockForUpdate()->find($exam->id);
+            // Serialize set creation with scan batches and other structural edits.
+            $exam = $this->structureLock->lockForStructuralEdit($exam);
 
             $labels = ExamSet::query()->where('exam_id', $exam->id)->pluck('label')->all();
             if (count($labels) >= self::MAX_SETS) {
-                throw ValidationException::withMessages(['exam' => ['An exam can have at most ' . self::MAX_SETS . ' sets.']]);
+                throw ValidationException::withMessages(['exam' => ['An exam can have at most '.self::MAX_SETS.' sets.']]);
             }
 
             $next = collect(range('A', 'Z'))->first(fn ($l) => ! in_array($l, $labels, true));
@@ -114,7 +120,7 @@ class ExamService
         $paths = [];
 
         DB::transaction(function () use ($user, $set, &$paths) {
-            $exam = Exam::query()->lockForUpdate()->find($set->exam_id);
+            $exam = $set->exam ? $this->structureLock->lockForStructuralEdit($set->exam) : null;
             if (! $exam) {
                 throw ValidationException::withMessages(['set' => ['This set is not available.']]);
             }

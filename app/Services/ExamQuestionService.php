@@ -18,15 +18,23 @@ use Illuminate\Validation\ValidationException;
 class ExamQuestionService
 {
     public const MAX_QUESTIONS = 50;
+
     public const LETTERS = ['A', 'B', 'C', 'D', 'E'];
+
+    public function __construct(private ExamStructureLock $structureLock) {}
 
     public function create(User $user, ExamSet $set, array $data): ExamQuestion
     {
         return DB::transaction(function () use ($user, $set, $data) {
+            $exam = $set->exam;
+            if (! $exam) {
+                throw ValidationException::withMessages(['set' => ['This set is not available.']]);
+            }
+            $exam = $this->structureLock->lockForStructuralEdit($exam);
+
             // Lock the set so two requests cannot take the same position or pass the limit together.
             $locked = ExamSet::query()->lockForUpdate()->find($set->id);
-            $exam = $locked?->exam;
-            if (! $exam) {
+            if (! $locked) {
                 throw ValidationException::withMessages(['set' => ['This set is not available.']]);
             }
 
@@ -34,7 +42,7 @@ class ExamQuestionService
 
             $count = $locked->questions()->count();
             if ($count >= self::MAX_QUESTIONS) {
-                throw ValidationException::withMessages(['body' => ['A set can have at most ' . self::MAX_QUESTIONS . ' questions.']]);
+                throw ValidationException::withMessages(['body' => ['A set can have at most '.self::MAX_QUESTIONS.' questions.']]);
             }
 
             $q = new ExamQuestion($clean);
@@ -56,11 +64,13 @@ class ExamQuestionService
     public function update(User $user, ExamQuestion $question, array $data): ExamQuestion
     {
         return DB::transaction(function () use ($user, $question, $data) {
-            $row = ExamQuestion::query()->lockForUpdate()->find($question->id);
-            $exam = $row?->set?->exam;
-            if (! $exam) {
+            $initial = ExamQuestion::query()->with('set.exam')->find($question->id);
+            $exam = $initial?->set?->exam;
+            if (! $initial || ! $exam) {
                 throw ValidationException::withMessages(['question' => ['This question is not available.']]);
             }
+            $exam = $this->structureLock->lockForStructuralEdit($exam);
+            $row = ExamQuestion::query()->lockForUpdate()->findOrFail($question->id);
 
             $clean = $this->validated($exam, $data);
             $flags = [
@@ -86,11 +96,13 @@ class ExamQuestionService
         $path = null;
 
         DB::transaction(function () use ($user, $question, &$path) {
-            $row = ExamQuestion::query()->lockForUpdate()->find($question->id);
-            $exam = $row?->set?->exam;
-            if (! $row || ! $exam) {
+            $initial = ExamQuestion::query()->with('set.exam')->find($question->id);
+            $exam = $initial?->set?->exam;
+            if (! $initial || ! $exam) {
                 throw ValidationException::withMessages(['question' => ['This question is not available.']]);
             }
+            $exam = $this->structureLock->lockForStructuralEdit($exam);
+            $row = ExamQuestion::query()->lockForUpdate()->findOrFail($question->id);
 
             $path = $row->image_path;
             $setId = $row->exam_set_id;
@@ -110,9 +122,13 @@ class ExamQuestionService
     public function reorder(User $user, ExamSet $set, array $ids): void
     {
         DB::transaction(function () use ($user, $set, $ids) {
-            $locked = ExamSet::query()->lockForUpdate()->find($set->id);
-            $exam = $locked?->exam;
+            $exam = $set->exam;
             if (! $exam) {
+                throw ValidationException::withMessages(['set' => ['This set is not available.']]);
+            }
+            $exam = $this->structureLock->lockForStructuralEdit($exam);
+            $locked = ExamSet::query()->lockForUpdate()->find($set->id);
+            if (! $locked) {
                 throw ValidationException::withMessages(['set' => ['This set is not available.']]);
             }
 
@@ -150,7 +166,7 @@ class ExamQuestionService
 
         $choices = array_values(array_map(fn ($c) => trim((string) $c), (array) ($data['choices'] ?? [])));
         if (count($choices) !== (int) $exam->choice_count) {
-            $errors['choices'][] = 'This exam uses ' . $exam->choice_count . ' choices.';
+            $errors['choices'][] = 'This exam uses '.$exam->choice_count.' choices.';
         } elseif (in_array('', $choices, true)) {
             $errors['choices'][] = 'Every choice needs text.';
         }
