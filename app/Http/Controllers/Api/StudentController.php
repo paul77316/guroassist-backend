@@ -1,4 +1,5 @@
 <?php
+
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
@@ -15,14 +16,16 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
-class StudentController extends Controller {
+class StudentController extends Controller
+{
     private const LOAD = ['sections.gradeLevel', 'yearLevels.gradeLevel'];
 
-    public function index(Request $request) {
+    public function index(Request $request)
+    {
         $this->authorize('viewAny', Student::class);
         $user = $request->user();
 
-        $cacheKey = 'students_' . md5(json_encode([
+        $cacheKey = 'students_'.md5(json_encode([
             'user_id' => $user->id,
             'is_admin' => $user->isAdmin(),
             'class_assignment_id' => $request->class_assignment_id,
@@ -60,14 +63,19 @@ class StudentController extends Controller {
                         ->orWhere('student_id', 'like', "%{$search}%");
                 });
             }
-            $collection = StudentResource::collection($query->paginate($request->per_page ?? 20));
+            $collection = StudentResource::collection($query
+                ->orderBy('last_name')
+                ->orderBy('first_name')
+                ->paginate($request->per_page ?? 20));
+
             return $collection->response($request)->getData(true);
         });
 
         return response()->json($result);
     }
 
-    public function store(StoreStudentRequest $request, EnrollmentService $enrollments) {
+    public function store(StoreStudentRequest $request, EnrollmentService $enrollments)
+    {
         $data = $request->validated();
         $classId = $data['class_assignment_id'] ?? null;
         $gradeId = $request->user()->isAdmin() ? ($data['grade_level_id'] ?? null) : null;
@@ -94,26 +102,33 @@ class StudentController extends Controller {
                     'grade_level_id' => $gradeId,
                 ]);
             }
+
             return $student;
         });
 
         return new StudentResource($student->load(self::LOAD));
     }
 
-    public function show(Student $student) {
+    public function show(Student $student)
+    {
         $this->authorize('view', $student);
+
         return new StudentResource($student->load(self::LOAD));
     }
 
-    public function update(UpdateStudentRequest $request, Student $student) {
+    public function update(UpdateStudentRequest $request, Student $student)
+    {
         $student->update($request->validated());
+
         return new StudentResource($student->load(self::LOAD));
     }
 
-    public function destroy(Student $student) {
+    public function destroy(Student $student)
+    {
         $this->authorize('delete', $student);
         $student->update(['status' => 'archived']);
         $student->delete(); // soft delete — row stays, deleted_at is set
+
         return response()->noContent();
     }
 }
